@@ -139,6 +139,32 @@ If you want the full app state instead of just imported campaign JSON:
   - re-index PDFs
   - pull the same Ollama models
 
+## PF2e models on another PC
+
+Yes. The custom Pathfinder models are easy to recreate on another PC as long as Ollama is installed.
+
+From this repo:
+
+1. Pull the base models:
+   - `ollama pull gpt-oss:20b`
+   - `ollama pull qwen2.5-coder:1.5b-base`
+   - `ollama pull qwen2.5:3b`
+2. Build the custom models:
+   - `powershell -ExecutionPolicy Bypass -File .\scripts\setup-ollama-models.ps1`
+
+That will build:
+
+- `gpt-oss-20b-optimized:latest`
+- `lorebound-pf2e:latest`
+- `lorebound-pf2e-fast:latest`
+- `lorebound-pf2e-ultra-fast:latest`
+- `lorebound-pf2e-pure:latest`
+
+If the other PC is weaker, use:
+
+- `lorebound-pf2e-fast:latest` or
+- `lorebound-pf2e-ultra-fast:latest`
+
 ## Local AI quick setup (optional)
 
 1. Install and run Ollama locally.
