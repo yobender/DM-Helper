@@ -14,6 +14,23 @@ const AI_PDF_SNIPPET_LIMIT = 6;
 const OLLAMA_BOOT_RETRY_COUNT = 12;
 const OLLAMA_BOOT_RETRY_DELAY_MS = 1000;
 const PDF_INDEX_CACHE_FILENAME = "pdf-index-cache.v1.json";
+const PDF_RETRIEVAL_CHUNK_SIZE = 1400;
+const PDF_RETRIEVAL_CHUNK_OVERLAP = 240;
+const PDF_EMBED_BATCH_SIZE = 16;
+const PDF_HYBRID_CANDIDATE_FILE_LIMIT = 6;
+const PDF_HYBRID_MATCH_LIMIT = 60;
+const PDF_EMBEDDING_MODEL_CANDIDATES = [
+  "all-minilm:latest",
+  "all-minilm",
+  "embeddinggemma:latest",
+  "embeddinggemma",
+  "qwen3-embedding:latest",
+  "qwen3-embedding",
+  "nomic-embed-text:latest",
+  "nomic-embed-text",
+  "mxbai-embed-large:latest",
+  "mxbai-embed-large",
+];
 const AI_MODEL_LABELS = Object.freeze({
   "lorebound-pf2e:latest": "LoreBound PF2e Deep (20B)",
   "lorebound-pf2e-fast:latest": "LoreBound PF2e Fast (20B)",
@@ -32,6 +49,7 @@ const AI_MODEL_LABELS = Object.freeze({
   "qwen2.5-coder:1.5b-base": "Qwen 2.5 Coder Base (1.5B)",
   "qwen2.5-coder:32b": "Qwen 2.5 Coder (32B)",
 });
+const KINGDOM_RULES_DATA = loadKingdomRulesData();
 
 let mainWindow = null;
 const pdfViewerWindows = new Set();
@@ -41,6 +59,31 @@ let pdfIndexCache = {
   files: [],
 };
 let ollamaBootPromise = null;
+let pdfEmbeddingModelCache = {
+  endpoint: "",
+  checkedAt: 0,
+  model: "",
+};
+
+function loadKingdomRulesData() {
+  try {
+    return require("./kingdom-rules-data.json");
+  } catch {
+    return {
+      latestProfileId: "fallback",
+      profiles: [
+        {
+          id: "fallback",
+          label: "Kingdom Rules Profile",
+          shortLabel: "Kingdom",
+          summary: "Fallback kingdom rules profile used because the shared rules file could not be loaded.",
+          turnStructure: [],
+          aiContextSummary: [],
+        },
+      ],
+    };
+  }
+}
 
 wireProcessStabilityGuards();
 
@@ -130,6 +173,130 @@ function getPdfIndexCachePath() {
   return path.join(app.getPath("userData"), PDF_INDEX_CACHE_FILENAME);
 }
 
+function sanitizeEmbeddingVector(rawVector) {
+  if (!Array.isArray(rawVector) || !rawVector.length) return null;
+  const clean = rawVector
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .slice(0, 4096);
+  if (!clean.length) return null;
+  return normalizeEmbeddingVector(clean);
+}
+
+function normalizeEmbeddingVector(vector) {
+  const clean = Array.isArray(vector) ? vector.map((value) => Number(value)).filter((value) => Number.isFinite(value)) : [];
+  if (!clean.length) return null;
+  let magnitude = 0;
+  for (const value of clean) {
+    magnitude += value * value;
+  }
+  const norm = Math.sqrt(magnitude);
+  if (!Number.isFinite(norm) || norm <= 0) return null;
+  return clean.map((value) => Number((value / norm).toFixed(6)));
+}
+
+function serializeEmbeddingVector(vector) {
+  return Array.isArray(vector) ? vector.map((value) => Number(Number(value).toFixed(6))).filter((value) => Number.isFinite(value)) : [];
+}
+
+function buildFileSemanticSource(fileName, summary, pages) {
+  const summaryText = normalizePdfText(String(summary || ""));
+  if (summaryText) {
+    return normalizePdfText(`${fileName}\n${summaryText}`).slice(0, 2400);
+  }
+  const preview = (Array.isArray(pages) ? pages : [])
+    .slice(0, 3)
+    .map((page) => normalizePdfText(page?.text || ""))
+    .filter(Boolean)
+    .join(" ");
+  return normalizePdfText(`${fileName}\n${preview}`).slice(0, 2400);
+}
+
+function buildRetrievalChunksForPages(pages, chunkSize = PDF_RETRIEVAL_CHUNK_SIZE, overlap = PDF_RETRIEVAL_CHUNK_OVERLAP) {
+  const chunks = [];
+  for (const page of Array.isArray(pages) ? pages : []) {
+    const pageNum = Number.parseInt(String(page?.page || chunks.length + 1), 10) || chunks.length + 1;
+    const text = normalizePdfText(String(page?.text || ""));
+    if (!text) continue;
+    let start = 0;
+    let chunkIndex = 0;
+    while (start < text.length) {
+      let end = Math.min(text.length, start + Math.max(320, Number(chunkSize) || PDF_RETRIEVAL_CHUNK_SIZE));
+      if (end < text.length) {
+        const window = text.slice(start, Math.min(text.length, end + 180));
+        const breakpoints = [". ", "? ", "! ", "; ", ", ", " "];
+        let best = -1;
+        for (const marker of breakpoints) {
+          const hit = window.lastIndexOf(marker);
+          if (hit > best) best = hit;
+        }
+        if (best >= 240) {
+          end = start + best + 1;
+        }
+      }
+      const chunkText = normalizePdfText(text.slice(start, end));
+      if (chunkText.length >= 120) {
+        chunks.push({
+          id: `p${pageNum}-c${chunkIndex + 1}`,
+          page: pageNum,
+          pageEnd: pageNum,
+          text: chunkText,
+          textLower: chunkText.toLowerCase(),
+          charCount: chunkText.length,
+          embedding: null,
+        });
+        chunkIndex += 1;
+      }
+      if (end >= text.length) break;
+      start = Math.max(start + 1, end - Math.max(60, Number(overlap) || PDF_RETRIEVAL_CHUNK_OVERLAP));
+    }
+  }
+  return chunks;
+}
+
+function sanitizeRetrievalChunk(rawChunk, fallbackChunk = null) {
+  const source = rawChunk && typeof rawChunk === "object" ? rawChunk : {};
+  const baseText = normalizePdfText(String(source.text || fallbackChunk?.text || ""));
+  if (!baseText) return null;
+  const page = Number.parseInt(String(source.page ?? fallbackChunk?.page ?? 1), 10) || 1;
+  const pageEnd = Number.parseInt(String(source.pageEnd ?? fallbackChunk?.pageEnd ?? page), 10) || page;
+  const embedding = sanitizeEmbeddingVector(source.embedding || fallbackChunk?.embedding);
+  return {
+    id: String(source.id || fallbackChunk?.id || `p${page}-c1`).trim() || `p${page}-c1`,
+    page,
+    pageEnd: Math.max(page, pageEnd),
+    text: baseText,
+    textLower: baseText.toLowerCase(),
+    charCount: baseText.length,
+    embedding,
+  };
+}
+
+function sanitizeFileRetrieval(rawRetrieval, pages, fileName, summary) {
+  const source = rawRetrieval && typeof rawRetrieval === "object" ? rawRetrieval : {};
+  const baseChunks = buildRetrievalChunksForPages(pages);
+  const existingChunks = new Map();
+  if (Array.isArray(source.chunks)) {
+    for (const rawChunk of source.chunks) {
+      const cleanChunk = sanitizeRetrievalChunk(rawChunk);
+      if (!cleanChunk) continue;
+      existingChunks.set(cleanChunk.id, cleanChunk);
+    }
+  }
+  const chunks = baseChunks
+    .map((baseChunk) => sanitizeRetrievalChunk(existingChunks.get(baseChunk.id), baseChunk))
+    .filter(Boolean);
+  return {
+    chunkSize: Number.parseInt(String(source.chunkSize || PDF_RETRIEVAL_CHUNK_SIZE), 10) || PDF_RETRIEVAL_CHUNK_SIZE,
+    chunkOverlap: Number.parseInt(String(source.chunkOverlap || PDF_RETRIEVAL_CHUNK_OVERLAP), 10) || PDF_RETRIEVAL_CHUNK_OVERLAP,
+    embeddingModel: String(source.embeddingModel || "").trim(),
+    fileEmbedding: sanitizeEmbeddingVector(source.fileEmbedding),
+    fileEmbeddingUpdatedAt: String(source.fileEmbeddingUpdatedAt || "").trim(),
+    fileSemanticSource: buildFileSemanticSource(fileName, summary, pages),
+    chunks,
+  };
+}
+
 function sanitizeIndexedPage(rawPage, fallbackPageNumber) {
   const pageNum = Number.parseInt(String(rawPage?.page ?? fallbackPageNumber), 10) || fallbackPageNumber;
   const text = normalizePdfText(String(rawPage?.text || ""));
@@ -142,6 +309,26 @@ function sanitizeIndexedPage(rawPage, fallbackPageNumber) {
   };
 }
 
+function normalizeStoredPdfSummaryText(text) {
+  const source = String(text || "").replace(/\r\n?/g, "\n");
+  if (!source) return "";
+  const lines = source.split("\n").map((line) => line.replace(/[ \t]+/g, " ").trimEnd());
+  const cleaned = [];
+  let lastBlank = false;
+  for (const line of lines) {
+    const normalized = line.trim() ? line : "";
+    if (!normalized) {
+      if (lastBlank) continue;
+      cleaned.push("");
+      lastBlank = true;
+      continue;
+    }
+    lastBlank = false;
+    cleaned.push(normalized);
+  }
+  return cleaned.join("\n").trim().slice(0, 24000);
+}
+
 function sanitizeIndexedFile(rawFile) {
   const filePath = String(rawFile?.path || "").trim();
   const fileName = String(rawFile?.fileName || path.basename(filePath || "")).trim();
@@ -151,8 +338,9 @@ function sanitizeIndexedFile(rawFile) {
     .filter(Boolean);
   if (!filePath || !fileName || !pages.length) return null;
   const merged = normalizePdfText(pages.map((page) => page.text).join(" "));
-  const summary = normalizePdfText(String(rawFile?.summary || "")).slice(0, 24000);
+  const summary = normalizeStoredPdfSummaryText(rawFile?.summary);
   const summaryUpdatedAt = String(rawFile?.summaryUpdatedAt || "").trim();
+  const retrieval = sanitizeFileRetrieval(rawFile?.retrieval, pages, fileName, summary);
   return {
     path: filePath,
     fileName,
@@ -162,6 +350,7 @@ function sanitizeIndexedFile(rawFile) {
     charCount: merged.length,
     summary,
     summaryUpdatedAt,
+    retrieval,
   };
 }
 
@@ -182,8 +371,10 @@ function buildPdfIndexSummary() {
       path: String(file?.path || "").trim(),
       pageCount: Array.isArray(file?.pages) ? file.pages.length : 0,
       charCount: Number.parseInt(String(file?.charCount || 0), 10) || 0,
-      summary: normalizePdfText(String(file?.summary || "")).slice(0, 24000),
+      summary: normalizeStoredPdfSummaryText(file?.summary),
       summaryUpdatedAt: String(file?.summaryUpdatedAt || "").trim(),
+      retrievalChunks: Array.isArray(file?.retrieval?.chunks) ? file.retrieval.chunks.length : 0,
+      retrievalEmbeddingModel: String(file?.retrieval?.embeddingModel || "").trim(),
     }))
     .filter((file) => file.fileName && file.path)
     .sort((a, b) => a.fileName.localeCompare(b.fileName) || a.path.localeCompare(b.path));
@@ -220,8 +411,25 @@ async function savePdfIndexCacheToDisk() {
     files: pdfIndexCache.files.map((file) => ({
       path: String(file?.path || "").trim(),
       fileName: String(file?.fileName || "").trim(),
-      summary: normalizePdfText(String(file?.summary || "")).slice(0, 24000),
+      summary: normalizeStoredPdfSummaryText(file?.summary),
       summaryUpdatedAt: String(file?.summaryUpdatedAt || "").trim(),
+      retrieval: {
+        chunkSize: Number.parseInt(String(file?.retrieval?.chunkSize || PDF_RETRIEVAL_CHUNK_SIZE), 10) || PDF_RETRIEVAL_CHUNK_SIZE,
+        chunkOverlap: Number.parseInt(String(file?.retrieval?.chunkOverlap || PDF_RETRIEVAL_CHUNK_OVERLAP), 10) || PDF_RETRIEVAL_CHUNK_OVERLAP,
+        embeddingModel: String(file?.retrieval?.embeddingModel || "").trim(),
+        fileEmbeddingUpdatedAt: String(file?.retrieval?.fileEmbeddingUpdatedAt || "").trim(),
+        fileEmbedding: serializeEmbeddingVector(file?.retrieval?.fileEmbedding),
+        chunks: (Array.isArray(file?.retrieval?.chunks) ? file.retrieval.chunks : [])
+          .map((chunk) => sanitizeRetrievalChunk(chunk))
+          .filter(Boolean)
+          .map((chunk) => ({
+            id: chunk.id,
+            page: chunk.page,
+            pageEnd: chunk.pageEnd,
+            text: chunk.text,
+            embedding: serializeEmbeddingVector(chunk.embedding),
+          })),
+      },
       pages: (Array.isArray(file?.pages) ? file.pages : [])
         .map((page, index) => sanitizeIndexedPage(page, index + 1))
         .filter(Boolean)
@@ -284,19 +492,19 @@ function registerIpc() {
       try {
         const buffer = await fs.readFile(pdfPath);
         const pages = await extractPdfPages(buffer, MAX_CHARS_PER_FILE);
-        const merged = normalizePdfText(pages.map((page) => page.text).join(" "));
         const existing = existingByPath.get(pdfPath);
-
-        indexedFiles.push({
+        const merged = normalizePdfText(pages.map((page) => page.text).join(" "));
+        const canReuseRetrieval =
+          existing &&
+          normalizePdfText(String(existing?.text || existing?.pages?.map((page) => page.text || "").join(" ") || "")) === merged;
+        indexedFiles.push(sanitizeIndexedFile({
           path: pdfPath,
           fileName: path.basename(pdfPath),
           pages,
-          text: merged,
-          textLower: merged.toLowerCase(),
-          charCount: merged.length,
-          summary: normalizePdfText(String(existing?.summary || "")).slice(0, 24000),
+          summary: normalizeStoredPdfSummaryText(existing?.summary),
           summaryUpdatedAt: String(existing?.summaryUpdatedAt || "").trim(),
-        });
+          retrieval: canReuseRetrieval ? existing?.retrieval : null,
+        }));
       } catch {
         failed += 1;
       }
@@ -328,35 +536,14 @@ function registerIpc() {
     const query = String(payload?.query || "").trim();
     const limitRaw = Number.parseInt(String(payload?.limit || "20"), 10);
     const limit = Number.isNaN(limitRaw) ? 20 : Math.max(1, Math.min(limitRaw, 100));
+    const config = normalizeAiConfig(payload?.config);
 
     if (!query) return { results: [] };
     if (!pdfIndexCache.files.length) {
       throw new Error("No PDFs indexed yet. Run Index PDFs first.");
     }
 
-    const searchParts = buildSearchParts(query);
-    if (!searchParts.words.length && !searchParts.phrase) {
-      return { results: [] };
-    }
-    const ranked = [];
-
-    for (const file of pdfIndexCache.files) {
-      const pages = getIndexedPages(file);
-      for (const page of pages) {
-        const match = scoreTextAgainstQuery(page.textLower, searchParts);
-        if (!match.score) continue;
-        ranked.push({
-          fileName: file.fileName,
-          path: file.path,
-          page: page.page,
-          score: match.score,
-          snippet: makeSnippet(page.text, match.firstHit),
-        });
-      }
-    }
-
-    ranked.sort((a, b) => b.score - a.score || a.fileName.localeCompare(b.fileName) || a.page - b.page);
-    return { results: ranked.slice(0, limit) };
+    return searchIndexedPdfHybrid(query, limit, { config });
   });
 
   ipcMain.handle("pdf:summarize-file", async (event, payload) => {
@@ -387,7 +574,8 @@ function registerIpc() {
     }
 
     const config = normalizeAiConfig(payload?.config);
-    const summaryConfig = buildPdfSummaryConfig(config);
+    const chunkSummaryConfig = buildPdfSummaryConfig(config, "chunk");
+    const finalSummaryConfig = buildPdfSummaryConfig(config, "final");
     const text = normalizePdfText(String(target.text || target.pages?.map((page) => page.text || "").join(" ") || ""));
     if (!text) {
       throw new Error("Indexed PDF text is empty for this file.");
@@ -421,7 +609,7 @@ function registerIpc() {
         total: chunks.length,
       });
       try {
-        const raw = await generateWithOllama(summaryConfig, prompt);
+        const raw = await generateWithOllama(chunkSummaryConfig, prompt);
         const cleaned = sanitizeAiTextOutput(raw);
         chunkSummaries.push(cleaned || extractiveChunkSummary(chunkText));
       } catch {
@@ -443,16 +631,45 @@ function registerIpc() {
     });
     let finalSummary = "";
     try {
-      const rawFinal = await generateWithOllama(summaryConfig, combinedPrompt);
+      const rawFinal = await generateWithOllama(finalSummaryConfig, combinedPrompt);
       finalSummary = sanitizeAiTextOutput(rawFinal);
     } catch {
       finalSummary = "";
     }
-    if (!finalSummary) {
+    if (!isUsefulPdfSummary(finalSummary)) {
+      emitPdfSummarizeProgress(event?.sender, {
+        stage: "combine",
+        fileName: target.fileName,
+        path: target.path,
+        current: Math.max(1, chunks.length),
+        total: progressTotal,
+        message: `Refining summary structure for ${target.fileName}...`,
+      });
+      try {
+        const retryPrompt = buildPdfFinalSummaryRetryPrompt({
+          fileName: target.fileName,
+          chunkSummaries,
+        });
+        const retryConfig = {
+          ...finalSummaryConfig,
+          maxOutputTokens: Math.max(Number(finalSummaryConfig.maxOutputTokens || 0) || 0, 1600),
+          timeoutSec: Math.max(Number(finalSummaryConfig.timeoutSec || 0) || 0, 480),
+        };
+        retryConfig.timeoutMs = Math.max(15000, Number(retryConfig.timeoutSec || 0) * 1000);
+        const rawRetry = await generateWithOllama(retryConfig, retryPrompt);
+        const cleanedRetry = sanitizeAiTextOutput(rawRetry);
+        if (isUsefulPdfSummary(cleanedRetry)) {
+          finalSummary = cleanedRetry;
+        }
+      } catch {
+        // Fall back below.
+      }
+    }
+    if (!isUsefulPdfSummary(finalSummary)) {
       finalSummary = combineChunkSummariesFallback(target.fileName, chunkSummaries);
     }
 
-    target.summary = normalizePdfText(finalSummary).slice(0, 24000);
+    target.summary = normalizeStoredPdfSummaryText(finalSummary);
     target.summaryUpdatedAt = new Date().toISOString();
     await savePdfIndexCacheToDisk();
     emitPdfSummarizeProgress(event?.sender, {
@@ -517,6 +734,8 @@ function registerIpc() {
     }
 
     const mode = String(payload?.mode || "session");
+    const activeTab = String(payload?.context?.activeTab || "").trim();
+    const selectedPdfFile = String(payload?.context?.selectedPdfFile || "").trim();
     const context =
       payload?.context && typeof payload.context === "object" && !Array.isArray(payload.context)
         ? payload.context
@@ -524,6 +743,8 @@ function registerIpc() {
     const config = normalizeAiConfig(payload?.config);
     const enrichedContext = {
       ...context,
+      selectedPdfFile,
+      selectedPdfPreview: selectedPdfFile ? buildSelectedPdfPreview(selectedPdfFile, 1200) : "",
       pdfContextEnabled: false,
       pdfSnippets: [],
       pdfIndexedFiles: getIndexedPdfFileNames(config.compactContext ? 20 : 40),
@@ -539,7 +760,13 @@ function registerIpc() {
         .join(" ")
         .trim();
       const snippetLimit = config.compactContext ? Math.min(3, AI_PDF_SNIPPET_LIMIT) : AI_PDF_SNIPPET_LIMIT;
-      enrichedContext.pdfSnippets = collectPdfContextForAi(query, snippetLimit);
+      enrichedContext.pdfSnippets = await collectPdfContextForAi(query, snippetLimit, {
+        config,
+        preferredFileName: selectedPdfFile,
+      });
+      if (!enrichedContext.pdfSnippets.length && selectedPdfFile && (activeTab === "pdf" || isPdfGroundedQuestion(input))) {
+        enrichedContext.pdfSnippets = collectSelectedPdfFallbackContext(selectedPdfFile, query, snippetLimit);
+      }
       enrichedContext.pdfContextEnabled = enrichedContext.pdfSnippets.length > 0;
     }
 
@@ -676,6 +903,401 @@ function getIndexedPages(file) {
     : [];
 }
 
+function ensureFileRetrievalState(file) {
+  if (!file || typeof file !== "object") return { chunks: [], embeddingModel: "", fileEmbedding: null, fileSemanticSource: "" };
+  if (!file.retrieval || typeof file.retrieval !== "object") {
+    file.retrieval = sanitizeFileRetrieval(null, getIndexedPages(file), String(file?.fileName || ""), String(file?.summary || ""));
+    return file.retrieval;
+  }
+  const expectedSource = buildFileSemanticSource(String(file?.fileName || ""), String(file?.summary || ""), getIndexedPages(file));
+  if (String(file.retrieval.fileSemanticSource || "") !== expectedSource) {
+    file.retrieval.fileSemanticSource = expectedSource;
+    file.retrieval.fileEmbedding = null;
+    file.retrieval.fileEmbeddingUpdatedAt = "";
+  }
+  if (!Array.isArray(file.retrieval.chunks) || !file.retrieval.chunks.length) {
+    file.retrieval = sanitizeFileRetrieval(file.retrieval, getIndexedPages(file), String(file?.fileName || ""), String(file?.summary || ""));
+  }
+  return file.retrieval;
+}
+
+function dotProduct(vectorA, vectorB) {
+  if (!Array.isArray(vectorA) || !Array.isArray(vectorB) || !vectorA.length || vectorA.length !== vectorB.length) return 0;
+  let total = 0;
+  for (let i = 0; i < vectorA.length; i += 1) {
+    total += Number(vectorA[i] || 0) * Number(vectorB[i] || 0);
+  }
+  return total;
+}
+
+function getChunkKey(file, chunk) {
+  const filePath = String(file?.path || "").trim();
+  const chunkId = String(chunk?.id || "").trim();
+  return `${filePath}::${chunkId}`;
+}
+
+function buildChunkSearchResult(file, chunk, score, firstHit = -1) {
+  return {
+    key: getChunkKey(file, chunk),
+    fileName: String(file?.fileName || "").trim(),
+    path: String(file?.path || "").trim(),
+    page: Number.parseInt(String(chunk?.page || 1), 10) || 1,
+    pageEnd: Number.parseInt(String(chunk?.pageEnd || chunk?.page || 1), 10) || (Number.parseInt(String(chunk?.page || 1), 10) || 1),
+    score,
+    snippet: makeSnippet(String(chunk?.text || ""), firstHit),
+    chunkId: String(chunk?.id || "").trim(),
+  };
+}
+
+function collectLexicalChunkMatches(files, query, limit = PDF_HYBRID_MATCH_LIMIT, preferredFileName = "") {
+  const searchParts = buildSearchParts(query);
+  if (!searchParts.words.length && !searchParts.phrase) return [];
+  const preferred = String(preferredFileName || "").trim().toLowerCase();
+  const ranked = [];
+  for (const file of files) {
+    const retrieval = ensureFileRetrievalState(file);
+    for (const chunk of retrieval.chunks) {
+      const match = scoreTextAgainstQuery(chunk.textLower, searchParts);
+      if (!match.score) continue;
+      const fileBoost = preferred && String(file?.fileName || "").trim().toLowerCase() === preferred ? 3 : 0;
+      ranked.push({
+        ...buildChunkSearchResult(file, chunk, match.score + fileBoost, match.firstHit),
+        lexicalScore: match.score + fileBoost,
+      });
+    }
+  }
+  ranked.sort((a, b) => b.lexicalScore - a.lexicalScore || a.fileName.localeCompare(b.fileName) || a.page - b.page);
+  return ranked.slice(0, Math.max(1, Math.min(Number(limit) || PDF_HYBRID_MATCH_LIMIT, 120)));
+}
+
+async function pickAvailableEmbeddingModel(endpoint, timeoutMs = 10000) {
+  const safeEndpoint = String(endpoint || DEFAULT_AI_ENDPOINT).replace(/\/+$/g, "");
+  const now = Date.now();
+  if (
+    pdfEmbeddingModelCache.endpoint === safeEndpoint &&
+    now - Number(pdfEmbeddingModelCache.checkedAt || 0) < 120000
+  ) {
+    return pdfEmbeddingModelCache.model || "";
+  }
+  const models = await listOllamaModelsWithRecovery(safeEndpoint, timeoutMs);
+  const match = PDF_EMBEDDING_MODEL_CANDIDATES.find((candidate) =>
+    models.some((model) => String(model || "").trim().toLowerCase() === candidate.toLowerCase())
+  );
+  pdfEmbeddingModelCache = {
+    endpoint: safeEndpoint,
+    checkedAt: now,
+    model: match || "",
+  };
+  return match || "";
+}
+
+async function requestOllamaEmbeddings(endpoint, model, inputs, timeoutMs = 45000) {
+  const safeInputs = (Array.isArray(inputs) ? inputs : [inputs]).map((item) => normalizePdfText(String(item || ""))).filter(Boolean);
+  if (!safeInputs.length) return [];
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(10000, Number(timeoutMs) || 45000));
+  try {
+    try {
+      const data = await requestOllamaJson(
+        `${endpoint}/api/embed`,
+        {
+          model,
+          input: safeInputs,
+          truncate: true,
+        },
+        controller.signal
+      );
+      const vectors = Array.isArray(data?.embeddings)
+        ? data.embeddings
+        : Array.isArray(data?.embedding)
+          ? [data.embedding]
+          : [];
+      return vectors.map((vector) => sanitizeEmbeddingVector(vector)).filter(Boolean);
+    } catch (err) {
+      const message = String(err?.message || err || "").toLowerCase();
+      if (!message.includes("/api/embed")) {
+        // requestOllamaJson uses generic errors, so retry the legacy endpoint unless we clearly timed out.
+      }
+      const vectors = [];
+      for (const text of safeInputs) {
+        const data = await requestOllamaJson(
+          `${endpoint}/api/embeddings`,
+          {
+            model,
+            prompt: text,
+          },
+          controller.signal
+        );
+        vectors.push(sanitizeEmbeddingVector(data?.embedding));
+      }
+      return vectors.filter(Boolean);
+    }
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`Embedding request timed out after ${Math.round((Number(timeoutMs) || 45000) / 1000)}s.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function ensureFileEmbeddings(files, endpoint, model, timeoutMs = 45000) {
+  const pending = [];
+  for (const file of files) {
+    const retrieval = ensureFileRetrievalState(file);
+    if (retrieval.embeddingModel && retrieval.embeddingModel !== model) {
+      retrieval.fileEmbedding = null;
+      retrieval.fileEmbeddingUpdatedAt = "";
+      for (const chunk of retrieval.chunks) {
+        chunk.embedding = null;
+      }
+      retrieval.embeddingModel = "";
+    }
+    if (Array.isArray(retrieval.fileEmbedding) && retrieval.fileEmbedding.length) {
+      continue;
+    }
+    const semanticText = normalizePdfText(String(retrieval.fileSemanticSource || buildFileSemanticSource(file.fileName, file.summary, getIndexedPages(file))));
+    if (!semanticText) continue;
+    pending.push({ file, text: semanticText });
+  }
+  if (!pending.length) return false;
+
+  let changed = false;
+  for (let index = 0; index < pending.length; index += PDF_EMBED_BATCH_SIZE) {
+    const batch = pending.slice(index, index + PDF_EMBED_BATCH_SIZE);
+    const vectors = await requestOllamaEmbeddings(endpoint, model, batch.map((item) => item.text), timeoutMs);
+    for (let offset = 0; offset < batch.length; offset += 1) {
+      const vector = vectors[offset];
+      if (!vector) continue;
+      const retrieval = ensureFileRetrievalState(batch[offset].file);
+      retrieval.fileEmbedding = vector;
+      retrieval.fileEmbeddingUpdatedAt = new Date().toISOString();
+      retrieval.embeddingModel = model;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+async function ensureChunkEmbeddingsForFiles(files, endpoint, model, timeoutMs = 45000) {
+  const pending = [];
+  for (const file of files) {
+    const retrieval = ensureFileRetrievalState(file);
+    if (retrieval.embeddingModel && retrieval.embeddingModel !== model) {
+      retrieval.fileEmbedding = null;
+      retrieval.fileEmbeddingUpdatedAt = "";
+      for (const chunk of retrieval.chunks) {
+        chunk.embedding = null;
+      }
+      retrieval.embeddingModel = "";
+    }
+    for (const chunk of retrieval.chunks) {
+      if (Array.isArray(chunk.embedding) && chunk.embedding.length) continue;
+      pending.push({ file, chunk });
+    }
+  }
+  if (!pending.length) return false;
+
+  let changed = false;
+  for (let index = 0; index < pending.length; index += PDF_EMBED_BATCH_SIZE) {
+    const batch = pending.slice(index, index + PDF_EMBED_BATCH_SIZE);
+    const vectors = await requestOllamaEmbeddings(endpoint, model, batch.map((item) => item.chunk.text), timeoutMs);
+    for (let offset = 0; offset < batch.length; offset += 1) {
+      const vector = vectors[offset];
+      if (!vector) continue;
+      const { file, chunk } = batch[offset];
+      const retrieval = ensureFileRetrievalState(file);
+      const target = retrieval.chunks.find((entry) => entry.id === chunk.id);
+      if (!target) continue;
+      target.embedding = vector;
+      retrieval.embeddingModel = model;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function collectSemanticFileCandidates(files, queryEmbedding, preferredFileName = "", limit = PDF_HYBRID_CANDIDATE_FILE_LIMIT) {
+  const preferred = String(preferredFileName || "").trim().toLowerCase();
+  const ranked = [];
+  for (const file of files) {
+    const retrieval = ensureFileRetrievalState(file);
+    if (!Array.isArray(retrieval.fileEmbedding) || !retrieval.fileEmbedding.length) continue;
+    let score = dotProduct(queryEmbedding, retrieval.fileEmbedding);
+    if (preferred && String(file?.fileName || "").trim().toLowerCase() === preferred) {
+      score += 0.035;
+    }
+    ranked.push({ file, score });
+  }
+  ranked.sort((a, b) => b.score - a.score || String(a.file?.fileName || "").localeCompare(String(b.file?.fileName || "")));
+  return ranked.slice(0, Math.max(1, Math.min(Number(limit) || PDF_HYBRID_CANDIDATE_FILE_LIMIT, 20)));
+}
+
+function collectSemanticChunkMatches(files, queryEmbedding, limit = PDF_HYBRID_MATCH_LIMIT, preferredFileName = "") {
+  const preferred = String(preferredFileName || "").trim().toLowerCase();
+  const ranked = [];
+  for (const file of files) {
+    const retrieval = ensureFileRetrievalState(file);
+    for (const chunk of retrieval.chunks) {
+      if (!Array.isArray(chunk.embedding) || !chunk.embedding.length) continue;
+      let score = dotProduct(queryEmbedding, chunk.embedding);
+      if (preferred && String(file?.fileName || "").trim().toLowerCase() === preferred) {
+        score += 0.02;
+      }
+      if (!Number.isFinite(score) || score <= 0) continue;
+      ranked.push({
+        ...buildChunkSearchResult(file, chunk, score, -1),
+        semanticScore: score,
+      });
+    }
+  }
+  ranked.sort((a, b) => b.semanticScore - a.semanticScore || a.fileName.localeCompare(b.fileName) || a.page - b.page);
+  return ranked.slice(0, Math.max(1, Math.min(Number(limit) || PDF_HYBRID_MATCH_LIMIT, 120)));
+}
+
+function fuseHybridMatches(lexicalMatches, semanticMatches, limit = 20) {
+  const fused = new Map();
+  const rankConstant = 60;
+  lexicalMatches.forEach((match, index) => {
+    const current = fused.get(match.key) || { ...match, lexicalRank: 0, semanticRank: 0, lexicalScore: 0, semanticScore: 0, fusedScore: 0 };
+    current.lexicalRank = index + 1;
+    current.lexicalScore = Math.max(Number(current.lexicalScore || 0), Number(match.lexicalScore || match.score || 0));
+    current.fusedScore += 1 / (rankConstant + index + 1);
+    fused.set(match.key, current);
+  });
+  semanticMatches.forEach((match, index) => {
+    const current = fused.get(match.key) || { ...match, lexicalRank: 0, semanticRank: 0, lexicalScore: 0, semanticScore: 0, fusedScore: 0 };
+    current.semanticRank = index + 1;
+    current.semanticScore = Math.max(Number(current.semanticScore || 0), Number(match.semanticScore || match.score || 0));
+    current.fusedScore += 1 / (rankConstant + index + 1);
+    if (!current.snippet && match.snippet) current.snippet = match.snippet;
+    fused.set(match.key, current);
+  });
+
+  const entries = [...fused.values()].map((entry) => {
+    const searchMode = entry.lexicalRank && entry.semanticRank ? "hybrid" : entry.semanticRank ? "semantic" : "lexical";
+    return {
+      ...entry,
+      searchMode,
+      score: Math.round(Number(entry.fusedScore || 0) * 100000),
+    };
+  });
+  entries.sort(
+    (a, b) =>
+      b.score - a.score ||
+      Number(b.semanticScore || 0) - Number(a.semanticScore || 0) ||
+      Number(b.lexicalScore || 0) - Number(a.lexicalScore || 0) ||
+      a.fileName.localeCompare(b.fileName) ||
+      a.page - b.page
+  );
+  return entries.slice(0, Math.max(1, Math.min(Number(limit) || 20, 100)));
+}
+
+async function searchIndexedPdfHybrid(query, limit = 20, options = {}) {
+  const normalizedQuery = normalizePdfText(String(query || ""));
+  if (!normalizedQuery) {
+    return {
+      results: [],
+      retrieval: {
+        mode: "none",
+        embeddingModel: "",
+        note: "Empty query.",
+      },
+    };
+  }
+
+  const preferredFileName = String(options?.preferredFileName || "").trim();
+  const restrictFileName = String(options?.restrictFileName || "").trim().toLowerCase();
+  const config = normalizeAiConfig(options?.config || {});
+  const allFiles = pdfIndexCache.files.filter((file) => {
+    if (!restrictFileName) return true;
+    return String(file?.fileName || "").trim().toLowerCase() === restrictFileName;
+  });
+  const lexicalMatches = collectLexicalChunkMatches(allFiles, normalizedQuery, Math.max(limit * 4, PDF_HYBRID_MATCH_LIMIT), preferredFileName);
+
+  let embeddingModel = "";
+  try {
+    embeddingModel = await pickAvailableEmbeddingModel(config.endpoint, Math.min(15000, Number(config.timeoutMs || 15000)));
+  } catch {
+    embeddingModel = "";
+  }
+  if (!embeddingModel) {
+    return {
+      results: lexicalMatches.slice(0, limit).map((entry) => ({ ...entry, searchMode: "lexical" })),
+      retrieval: {
+        mode: "lexical",
+        embeddingModel: "",
+        note: "No local embedding model is installed. Search used keyword ranking only.",
+      },
+    };
+  }
+
+  let changed = false;
+  try {
+    changed = (await ensureFileEmbeddings(allFiles, config.endpoint, embeddingModel, Math.max(25000, Number(config.timeoutMs || 0)))) || changed;
+    const queryEmbedding = (await requestOllamaEmbeddings(config.endpoint, embeddingModel, [normalizedQuery], Math.max(25000, Number(config.timeoutMs || 0))))[0];
+    if (!queryEmbedding) {
+      return {
+        results: lexicalMatches.slice(0, limit).map((entry) => ({ ...entry, searchMode: "lexical" })),
+        retrieval: {
+          mode: "lexical",
+          embeddingModel,
+          note: `Embedding model "${embeddingModel}" did not return a query vector. Search used keyword ranking only.`,
+        },
+      };
+    }
+
+    const lexicalCandidateFiles = new Map();
+    for (const match of lexicalMatches.slice(0, PDF_HYBRID_CANDIDATE_FILE_LIMIT * 3)) {
+      if (!lexicalCandidateFiles.has(match.path)) {
+        const file = allFiles.find((entry) => String(entry?.path || "").trim() === match.path);
+        if (file) lexicalCandidateFiles.set(match.path, file);
+      }
+      if (lexicalCandidateFiles.size >= PDF_HYBRID_CANDIDATE_FILE_LIMIT) break;
+    }
+    const semanticFileCandidates = collectSemanticFileCandidates(allFiles, queryEmbedding, preferredFileName, PDF_HYBRID_CANDIDATE_FILE_LIMIT);
+    const candidateFiles = new Map(semanticFileCandidates.map((entry) => [String(entry.file?.path || "").trim(), entry.file]));
+    for (const [filePath, file] of lexicalCandidateFiles.entries()) {
+      candidateFiles.set(filePath, file);
+    }
+    const candidateList = [...candidateFiles.values()];
+    changed = (await ensureChunkEmbeddingsForFiles(candidateList, config.endpoint, embeddingModel, Math.max(30000, Number(config.timeoutMs || 0)))) || changed;
+    if (changed) {
+      await savePdfIndexCacheToDisk();
+    }
+
+    const semanticMatches = collectSemanticChunkMatches(candidateList, queryEmbedding, Math.max(limit * 4, PDF_HYBRID_MATCH_LIMIT), preferredFileName);
+    const fused = fuseHybridMatches(lexicalMatches, semanticMatches, limit);
+    return {
+      results: fused,
+      retrieval: {
+        mode: semanticMatches.length && lexicalMatches.length ? "hybrid" : semanticMatches.length ? "semantic" : "lexical",
+        embeddingModel,
+        note:
+          semanticMatches.length && lexicalMatches.length
+            ? `Hybrid search combined keyword and semantic retrieval using ${embeddingModel}.`
+            : semanticMatches.length
+              ? `Semantic retrieval used ${embeddingModel}.`
+              : `Keyword ranking remained stronger than semantic retrieval for this query.`,
+      },
+    };
+  } catch (err) {
+    if (changed) {
+      await savePdfIndexCacheToDisk();
+    }
+    return {
+      results: lexicalMatches.slice(0, limit).map((entry) => ({ ...entry, searchMode: "lexical" })),
+      retrieval: {
+        mode: "lexical",
+        embeddingModel,
+        note: `Semantic retrieval failed, so search fell back to keyword ranking only. ${String(err?.message || err || "")}`.trim(),
+      },
+    };
+  }
+}
+
 function scoreTextAgainstQuery(textLower, searchParts) {
   const haystack = String(textLower || "");
   if (!haystack) return { score: 0, firstHit: -1 };
@@ -756,22 +1378,23 @@ function buildPdfSummaryResponse(file) {
   return {
     fileName: String(file?.fileName || "").trim(),
     path: String(file?.path || "").trim(),
-    summary: normalizePdfText(String(file?.summary || "")).slice(0, 24000),
+    summary: normalizeStoredPdfSummaryText(file?.summary),
     summaryUpdatedAt: String(file?.summaryUpdatedAt || "").trim(),
   };
 }
 
-function buildPdfSummaryConfig(config) {
+function buildPdfSummaryConfig(config, stage = "chunk") {
+  const isFinalStage = String(stage || "").toLowerCase() === "final";
   const next = {
     ...config,
-    temperature: Math.max(0, Math.min(Number(config?.temperature ?? 0.2), 0.4)),
-    maxOutputTokens: Math.max(Number(config?.maxOutputTokens || 0), 720),
+    temperature: Math.max(0, Math.min(Number(config?.temperature ?? 0.2), isFinalStage ? 0.25 : 0.35)),
+    maxOutputTokens: Math.max(Number(config?.maxOutputTokens || 0), isFinalStage ? 1400 : 520),
   };
   let timeoutSec = Number.parseInt(String(config?.timeoutSec || "120"), 10);
   if (!Number.isFinite(timeoutSec)) timeoutSec = 120;
-  timeoutSec = Math.max(timeoutSec, 240);
+  timeoutSec = Math.max(timeoutSec, isFinalStage ? 420 : 240);
   if (/20b/i.test(String(next.model || ""))) {
-    timeoutSec = Math.max(timeoutSec, 360);
+    timeoutSec = Math.max(timeoutSec, isFinalStage ? 480 : 360);
   }
   next.timeoutSec = timeoutSec;
   next.timeoutMs = timeoutSec * 1000;
@@ -799,16 +1422,26 @@ function splitTextIntoChunks(text, chunkSize = 7600, maxChunks = 6) {
 
 function buildPdfChunkSummaryPrompt({ fileName, chunkText, index, total }) {
   return [
-    `You are summarizing indexed PDF content for a GM prep tool.`,
+    `You are summarizing indexed PDF content for DM Helper, a GM prep tool.`,
     `Book: ${fileName}`,
     `Chunk ${index} of ${total}.`,
-    `Task: Write a concise chunk summary with these sections:`,
-    `- Core Topics`,
-    `- Rules / Mechanics`,
-    `- NPCs / Factions / Locations`,
-    `- GM Use At Table`,
+    `Task: extract the most useful GM-facing facts from this chunk only.`,
+    `Return these headings exactly:`,
+    `Adventure Beats:`,
+    `- bullet`,
+    `Key People / Factions:`,
+    `- bullet`,
+    `Key Places / Scenes:`,
+    `- bullet`,
+    `Threats / Obstacles / Clues:`,
+    `- bullet`,
+    `Rules / Mechanics Worth Prep:`,
+    `- bullet`,
+    `GM Use:`,
+    `- bullet`,
     `Keep it factual and grounded only in the provided chunk.`,
-    `No markdown tables. No policy text.`,
+    `No markdown tables. No bold. No numbering. Prefer short bullets over paragraphs.`,
+    `If a section has nothing useful, write "- None noted in this chunk."`,
     ``,
     `Chunk text:`,
     chunkText,
@@ -817,15 +1450,57 @@ function buildPdfChunkSummaryPrompt({ fileName, chunkText, index, total }) {
 
 function buildPdfFinalSummaryPrompt({ fileName, chunkSummaries }) {
   return [
-    `You are combining chunk summaries into one practical book summary for a GM.`,
+    `You are combining chunk summaries into one persistent GM-ready book brief for DM Helper.`,
     `Book: ${fileName}`,
-    `Produce these sections:`,
-    `1) What this book is for`,
-    `2) Key rules/mechanics`,
-    `3) Important entities (NPCs, factions, locations, monsters)`,
-    `4) GM prep checklist`,
-    `5) Fast session-use cheat sheet`,
-    `Keep it concise, usable, and factual.`,
+    `Return these headings exactly:`,
+    `Adventure Premise:`,
+    `- 2 to 4 bullets`,
+    `Main Threats / Stakes:`,
+    `- 3 to 6 bullets`,
+    `Key People / Factions:`,
+    `- 3 to 8 bullets`,
+    `Key Places / Scenes:`,
+    `- 3 to 8 bullets`,
+    `Likely Flow / Structure:`,
+    `- 3 to 6 bullets`,
+    `What To Prep First:`,
+    `- 5 to 8 bullets`,
+    `Fast Table Reference:`,
+    `- 4 to 8 bullets`,
+    `Keep it concise, factual, and immediately useful at the table.`,
+    `No markdown tables. No bold. No numbering. No incomplete sentences. Prefer bullets over paragraphs.`,
+    ``,
+    `Chunk summaries:`,
+    ...chunkSummaries.map((summary, i) => `Chunk ${i + 1}:\n${summary}`),
+  ].join("\n");
+}
+
+function buildPdfFinalSummaryRetryPrompt({ fileName, chunkSummaries }) {
+  return [
+    `You are fixing a weak or incomplete summary for DM Helper.`,
+    `Book: ${fileName}`,
+    `Return only a clean GM summary in this exact structure:`,
+    `Adventure Premise:`,
+    `- bullet`,
+    `Main Threats / Stakes:`,
+    `- bullet`,
+    `Key People / Factions:`,
+    `- bullet`,
+    `Key Places / Scenes:`,
+    `- bullet`,
+    `Likely Flow / Structure:`,
+    `- bullet`,
+    `What To Prep First:`,
+    `- bullet`,
+    `Fast Table Reference:`,
+    `- bullet`,
+    `Requirements:`,
+    `- use bullets only`,
+    `- no markdown tables`,
+    `- no bold`,
+    `- no numbered lists`,
+    `- no section may be empty`,
+    `- if a detail is unclear, keep it general rather than inventing specifics`,
     ``,
     `Chunk summaries:`,
     ...chunkSummaries.map((summary, i) => `Chunk ${i + 1}:\n${summary}`),
@@ -841,22 +1516,130 @@ function extractiveChunkSummary(chunkText) {
   return lines.length ? lines.join("\n") : `- ${clean.slice(0, 280)}...`;
 }
 
-function combineChunkSummariesFallback(fileName, chunkSummaries) {
-  const body = chunkSummaries.map((item) => normalizePdfText(String(item || ""))).filter(Boolean).join("\n");
-  if (!body) {
-    return `${fileName}\n- No summary could be generated from indexed text.`;
+function collectBulletsFromPdfSummarySection(text, label, fallbackLabels = []) {
+  const labels = [label, ...fallbackLabels];
+  const picked = [];
+  const seen = new Set();
+  for (const item of labels) {
+    const block = extractLabeledBlock(text, item);
+    if (!block) continue;
+    for (const line of splitAiLines(block)) {
+      const clean = String(line || "").replace(/^[-*]\s*/, "").trim();
+      if (!clean || /none noted in this chunk/i.test(clean)) continue;
+      const key = clean.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      picked.push(clean.endsWith(".") ? clean : `${clean}.`);
+    }
   }
+  return picked;
+}
+
+function takePdfSummaryBullets(lines, minCount, maxCount, fallbackLines = []) {
+  const unique = [];
+  const seen = new Set();
+  for (const line of [...(lines || []), ...(fallbackLines || [])]) {
+    const clean = normalizeSentenceText(line);
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(clean.endsWith(".") ? clean : `${clean}.`);
+  }
+  if (!unique.length) return [];
+  const min = Math.max(0, Number(minCount) || 0);
+  const max = Math.max(min || 1, Number(maxCount) || min || 1);
+  if (unique.length >= min) return unique.slice(0, max);
+  return unique.slice(0, max);
+}
+
+function isUsefulPdfSummary(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (isClearlyTruncatedOutput(raw)) return false;
+  if (/\|[^\n]{0,220}\|/.test(raw)) return false;
+  const required = [
+    "Adventure Premise",
+    "Main Threats / Stakes",
+    "Key People / Factions",
+    "Key Places / Scenes",
+    "Likely Flow / Structure",
+    "What To Prep First",
+    "Fast Table Reference",
+  ];
+  const headingCount = required.filter((label) => new RegExp(`^${escapeRegex(label)}\\s*:`, "im").test(raw)).length;
+  if (headingCount < 5) return false;
+  if (countBulletLikeLines(raw) < 10) return false;
+  return raw.length >= 320;
+}
+
+function combineChunkSummariesFallback(fileName, chunkSummaries) {
+  const summaries = chunkSummaries.map((item) => String(item || "")).filter(Boolean);
+  if (!summaries.length) {
+    return [
+      `Adventure Premise:`,
+      `- ${fileName} was indexed, but no usable summary could be generated from the saved chunk notes.`,
+      `Main Threats / Stakes:`,
+      `- Re-run summary or use PDF search for focused book details.`,
+      `Key People / Factions:`,
+      `- Use PDF search to identify named NPCs and factions.`,
+      `Key Places / Scenes:`,
+      `- Use PDF search to locate the opening area, main sites, and likely set pieces.`,
+      `Likely Flow / Structure:`,
+      `- Review the saved PDF search results for chapter or encounter order.`,
+      `What To Prep First:`,
+      `- Summarize the selected PDF again after confirming the indexed text looks clean.`,
+      `Fast Table Reference:`,
+      `- Keep PDF Intel open for exact page lookups.`,
+    ].join("\n");
+  }
+
+  const adventureBeats = takePdfSummaryBullets(
+    summaries.flatMap((summary) => collectBulletsFromPdfSummarySection(summary, "Adventure Beats")),
+    2,
+    6
+  );
+  const people = takePdfSummaryBullets(
+    summaries.flatMap((summary) => collectBulletsFromPdfSummarySection(summary, "Key People / Factions")),
+    3,
+    8
+  );
+  const places = takePdfSummaryBullets(
+    summaries.flatMap((summary) => collectBulletsFromPdfSummarySection(summary, "Key Places / Scenes")),
+    3,
+    8
+  );
+  const threats = takePdfSummaryBullets(
+    summaries.flatMap((summary) => collectBulletsFromPdfSummarySection(summary, "Threats / Obstacles / Clues")),
+    3,
+    8
+  );
+  const rules = takePdfSummaryBullets(
+    summaries.flatMap((summary) => collectBulletsFromPdfSummarySection(summary, "Rules / Mechanics Worth Prep")),
+    2,
+    6
+  );
+  const gmUse = takePdfSummaryBullets(
+    summaries.flatMap((summary) => collectBulletsFromPdfSummarySection(summary, "GM Use")),
+    3,
+    8
+  );
+
   return [
-    `${fileName} Summary`,
-    "What this book is for:",
-    "- Reference for campaign prep and table use based on indexed content.",
-    "Key points:",
-    ...body
-      .split(/\r?\n+/)
-      .map((line) => normalizePdfText(line))
-      .filter(Boolean)
-      .slice(0, 18)
-      .map((line) => (line.startsWith("- ") ? line : `- ${line}`)),
+    "Adventure Premise:",
+    ...takePdfSummaryBullets(adventureBeats, 1, 4, threats).map((line) => `- ${line}`),
+    "Main Threats / Stakes:",
+    ...takePdfSummaryBullets(threats, 1, 6, adventureBeats).map((line) => `- ${line}`),
+    "Key People / Factions:",
+    ...takePdfSummaryBullets(people, 1, 8, adventureBeats).map((line) => `- ${line}`),
+    "Key Places / Scenes:",
+    ...takePdfSummaryBullets(places, 1, 8, adventureBeats).map((line) => `- ${line}`),
+    "Likely Flow / Structure:",
+    ...takePdfSummaryBullets(adventureBeats, 1, 6, places).map((line) => `- ${line}`),
+    "What To Prep First:",
+    ...takePdfSummaryBullets(gmUse, 1, 8, threats.concat(rules)).map((line) => `- ${line}`),
+    "Fast Table Reference:",
+    ...takePdfSummaryBullets(rules.concat(people.slice(0, 2), places.slice(0, 2)), 1, 8, gmUse).map((line) => `- ${line}`),
   ].join("\n");
 }
 
@@ -1091,7 +1874,7 @@ async function generateWithOllama(config, userPrompt, recovered = false, timeout
           {
             role: "system",
             content:
-              "You are a tabletop GM writing assistant. Return concise, practical GM-facing text only.",
+              "You are a tabletop GM writing assistant. Return practical, complete GM-facing text only. Match requested structure exactly and never omit requested fields.",
           },
           { role: "user", content: userPrompt },
         ],
@@ -1112,7 +1895,8 @@ async function generateWithOllama(config, userPrompt, recovered = false, timeout
           },
           prompt: [
             "You are a tabletop GM writing assistant.",
-            "Return concise, practical GM-facing text only.",
+            "Return practical, complete GM-facing text only.",
+            "Match requested structure exactly and never omit requested fields.",
             "",
             userPrompt,
           ].join("\n"),
@@ -1205,9 +1989,15 @@ function extractOllamaText(data) {
 
 function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
   const latestSession = context?.latestSession || {};
+  const recentSessions = Array.isArray(context?.recentSessions) ? context.recentSessions : [];
   const openQuests = Array.isArray(context?.openQuests) ? context.openQuests : [];
+  const quests = Array.isArray(context?.quests) ? context.quests : [];
   const npcs = Array.isArray(context?.npcs) ? context.npcs : [];
   const locations = Array.isArray(context?.locations) ? context.locations : [];
+  const kingdom = context?.kingdom || null;
+  const selectedPdfFile = summarizeForPrompt(String(context?.selectedPdfFile || ""), 120);
+  const selectedPdfSummary = summarizeForPrompt(String(context?.selectedPdfSummary || ""), compactContext ? 720 : 1100);
+  const selectedPdfPreview = summarizeForPrompt(String(context?.selectedPdfPreview || ""), compactContext ? 720 : 1100);
   const indexedPdfFiles = Array.isArray(context?.pdfIndexedFiles) ? context.pdfIndexedFiles : [];
   const pdfSummaryBriefs = Array.isArray(context?.pdfSummaryBriefs) ? context.pdfSummaryBriefs : [];
   const indexedPdfCount = Number.parseInt(String(context?.pdfIndexedFileCount || indexedPdfFiles.length || 0), 10) || 0;
@@ -1220,6 +2010,12 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
   const tabContext = summarizeForPrompt(String(context?.tabContext || ""), limits.tab);
   const pdfSnippets = Array.isArray(context?.pdfSnippets) ? context.pdfSnippets : [];
   const pdfEnabled = context?.pdfContextEnabled === true;
+  const appRoleLines = getDmHelperAppRoleLines(activeTab);
+  const recentSessionLines = summarizeRecentSessionsForPrompt(recentSessions, compactContext ? 3 : 5);
+  const trackedNpcLines = summarizeTrackedNpcsForPrompt(npcs, compactContext ? 5 : 8);
+  const trackedQuestLines = summarizeTrackedQuestsForPrompt(quests, compactContext ? 5 : 8);
+  const trackedLocationLines = summarizeTrackedLocationsForPrompt(locations, compactContext ? 5 : 8);
+  const kingdomLines = summarizeKingdomForPrompt(kingdom, compactContext);
   const historyLimit = compactContext ? 6 : 10;
   const historyTurns = aiHistory
     .slice(-historyLimit)
@@ -1236,15 +2032,19 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
     session:
       "Produce structured, table-ready session notes. Follow requested section labels exactly and provide substantive detail (not just one short paragraph).",
     recap: "Rewrite as a short read-aloud recap for players (3-6 sentences).",
-    npc: "Rewrite as an NPC briefing with motive and attitude.",
+    npc: "Produce one table-ready NPC using the requested labels exactly. Give the NPC a clear motive, pressure, and immediately playable detail.",
     quest: "Rewrite as a quest objective with stakes and next actionable beat.",
     location: "Rewrite as a location briefing with atmosphere and immediate tension.",
     prep: "Rewrite as next-session prep bullet points.",
   };
+  const modeSpecificLines = getModeSpecificPromptLines(mode, input, context);
 
   const lines = [
     `Mode: ${mode}`,
     `Goal: ${modeGuide[mode] || modeGuide.session}`,
+    "",
+    ...appRoleLines,
+    ...(modeSpecificLines.length ? ["", ...modeSpecificLines] : []),
     "",
     "Draft input:",
     summarizeForPrompt(input, limits.draft),
@@ -1256,17 +2056,21 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
       String(latestSession?.summary || ""),
       limits.latest
     )}`,
+    ...(recentSessionLines.length ? ["Recent sessions in app:", ...recentSessionLines] : []),
     `Open quests: ${openQuests.map((q) => summarizeForPrompt(String(q?.title || ""), 80)).join("; ") || "None listed."}`,
-    `Known NPCs: ${npcs.map((n) => summarizeForPrompt(String(n?.name || ""), 60)).join(", ") || "None listed."}`,
-    `Known locations: ${
-      locations.map((l) => summarizeForPrompt(String(l?.name || ""), 60)).join(", ") || "None listed."
-    }`,
+    ...(trackedQuestLines.length ? ["Tracked quest records:", ...trackedQuestLines] : ["Tracked quest records: None listed."]),
+    ...(trackedNpcLines.length ? ["Tracked NPC records:", ...trackedNpcLines] : ["Tracked NPC records: None listed."]),
+    ...(trackedLocationLines.length ? ["Tracked location records:", ...trackedLocationLines] : ["Tracked location records: None listed."]),
+    ...(kingdomLines.length ? ["Kingdom records:", ...kingdomLines] : []),
     `PDF context enabled: ${pdfEnabled ? "yes" : "no"}`,
     `Indexed PDF files (${indexedPdfCount}): ${
       indexedPdfFiles.length
         ? indexedPdfFiles.map((name) => summarizeForPrompt(String(name || ""), 70)).join("; ")
         : "None indexed."
     }`,
+    `Selected PDF focus: ${selectedPdfFile || "None selected."}`,
+    ...(selectedPdfSummary ? [`Selected PDF summary: ${selectedPdfSummary}`] : []),
+    ...(selectedPdfPreview ? [`Selected PDF preview: ${selectedPdfPreview}`] : []),
     ...(pdfSummaryBriefs.length
       ? [
           "Saved PDF memory briefs:",
@@ -1302,12 +2106,220 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
     "Return only final GM-facing content.",
     "No instruction lists, no policy text, and no meta-rules in the answer.",
     "Keep facts grounded in provided context and avoid invented lore.",
-    "Source scope rule: you only have access to campaign context and indexed PDF files listed above.",
-    "If asked what books/sources/PDFs you can access, answer using only the indexed PDF file names.",
-    "Never claim access to external books, websites, or rules not listed in indexed PDF files.",
+    "Source scope rule: you only have access to campaign context, the active app-bundled kingdom rules profile if one is provided above, and indexed PDF files listed above.",
+    "If asked what books/sources/rules/PDFs you can access, answer using only the campaign data above, the active kingdom rules profile if present, and the indexed PDF file names.",
+    "Never claim access to external books, websites, or rules not listed in indexed PDF files or the active kingdom rules profile.",
   ];
 
   return lines.join("\n");
+}
+
+function getDmHelperAppRoleLines(activeTab) {
+  const tabId = String(activeTab || "").toLowerCase();
+  const workflowByTab = {
+    dashboard: "You are planning the GM's next moves. Output should be ready to attach to the latest session prep in the app.",
+    sessions: "You are helping maintain the session record. Output should be ready to apply into the latest session summary or next-prep fields.",
+    capture: "You are cleaning raw table notes into structured records the app can keep as live capture or session notes.",
+    writing: "You are drafting clean GM-facing text that the writing helper can store or paste into campaign notes.",
+    kingdom: "You are helping run a PF2e Kingmaker kingdom inside DM Helper. Output should be ready to save into kingdom notes, turn logs, settlement plans, or leader assignments.",
+    npcs: "You are creating or enriching structured NPC records for DM Helper. Output may be imported directly into NPC entries.",
+    quests: "You are creating or refining structured quest records for DM Helper. Output may be imported directly into quest entries.",
+    locations: "You are creating or refining structured location records for DM Helper. Output may be imported directly into location entries.",
+    pdf: "You are answering from indexed PDF context or producing a PDF query the app can run immediately.",
+    foundry: "You are preparing handoff/export notes that the GM can use in Foundry and store in session prep.",
+  };
+  return [
+    "App role: You are Loremaster inside the DM Helper app, helping the GM build and maintain structured campaign records and usable session prep.",
+    `Current app workflow: ${workflowByTab[tabId] || "You are helping the GM create content that can be saved back into DM Helper without cleanup."}`,
+    "Write content that fits the app workflow for the active tab and is ready to save or apply inside DM Helper.",
+  ];
+}
+
+function summarizeRecentSessionsForPrompt(sessions, limit = 4) {
+  return (sessions || [])
+    .slice(0, Math.max(0, Number(limit) || 0))
+    .map((session, index) => {
+      const title = summarizeForPrompt(String(session?.title || ""), 70) || `Session ${index + 1}`;
+      const date = summarizeForPrompt(String(session?.date || ""), 24);
+      const arc = summarizeForPrompt(String(session?.arc || ""), 50);
+      const summary = summarizeForPrompt(String(session?.summary || ""), 120);
+      return `- ${title}${date ? ` (${date})` : ""}${arc ? ` | arc: ${arc}` : ""} | ${summary || "No summary yet."}`;
+    })
+    .filter(Boolean);
+}
+
+function summarizeTrackedNpcsForPrompt(npcs, limit = 6) {
+  return (npcs || [])
+    .slice(0, Math.max(0, Number(limit) || 0))
+    .map((npc) => {
+      const name = summarizeForPrompt(String(npc?.name || ""), 60);
+      if (!name) return "";
+      const parts = [
+        summarizeForPrompt(String(npc?.role || ""), 40),
+        summarizeForPrompt(String(npc?.agenda || ""), 70),
+        summarizeForPrompt(String(npc?.disposition || ""), 32),
+      ].filter(Boolean);
+      const notes = summarizeForPrompt(String(npc?.notes || ""), 120);
+      return `- ${name}${parts.length ? ` | ${parts.join(" | ")}` : ""}${notes ? ` | notes: ${notes}` : ""}`;
+    })
+    .filter(Boolean);
+}
+
+function summarizeTrackedQuestsForPrompt(quests, limit = 6) {
+  return (quests || [])
+    .slice(0, Math.max(0, Number(limit) || 0))
+    .map((quest) => {
+      const title = summarizeForPrompt(String(quest?.title || ""), 70);
+      if (!title) return "";
+      const status = summarizeForPrompt(String(quest?.status || ""), 24);
+      const objective = summarizeForPrompt(String(quest?.objective || ""), 90);
+      const stakes = summarizeForPrompt(String(quest?.stakes || ""), 110);
+      const giver = summarizeForPrompt(String(quest?.giver || ""), 48);
+      return `- ${title}${status ? ` (${status})` : ""}${giver ? ` | giver: ${giver}` : ""}${objective ? ` | objective: ${objective}` : ""}${stakes ? ` | stakes: ${stakes}` : ""}`;
+    })
+    .filter(Boolean);
+}
+
+function summarizeTrackedLocationsForPrompt(locations, limit = 6) {
+  return (locations || [])
+    .slice(0, Math.max(0, Number(limit) || 0))
+    .map((location) => {
+      const name = summarizeForPrompt(String(location?.name || ""), 70);
+      if (!name) return "";
+      const hex = summarizeForPrompt(String(location?.hex || ""), 24);
+      const whatChanged = summarizeForPrompt(String(location?.whatChanged || ""), 90);
+      const notes = summarizeForPrompt(String(location?.notes || ""), 110);
+      return `- ${name}${hex ? ` [${hex}]` : ""}${whatChanged ? ` | changed: ${whatChanged}` : ""}${notes ? ` | notes: ${notes}` : ""}`;
+    })
+    .filter(Boolean);
+}
+
+function summarizeKingdomForPrompt(kingdom, compactContext = true) {
+  const data = kingdom && typeof kingdom === "object" ? kingdom : null;
+  if (!data) return [];
+  const profile = data?.rulesProfile || getDefaultKingdomRulesProfile();
+  const leaders = Array.isArray(data?.leaders) ? data.leaders : [];
+  const settlements = Array.isArray(data?.settlements) ? data.settlements : [];
+  const regions = Array.isArray(data?.regions) ? data.regions : [];
+  const recentTurns = Array.isArray(data?.recentTurns) ? data.recentTurns : [];
+  const commodities = data?.commodities || {};
+  const ruin = data?.ruin || {};
+  const lines = [
+    `- Sheet: ${summarizeForPrompt(String(data?.name || "Unnamed kingdom"), 90)} | turn ${summarizeForPrompt(String(data?.currentTurnLabel || "not set"), 36)} | level ${Number.parseInt(String(data?.level || "1"), 10) || 1} | size ${Number.parseInt(String(data?.size || "1"), 10) || 1} | Control DC ${Number.parseInt(String(data?.controlDC || "14"), 10) || 14}`,
+    `- Economy: RP ${Number.parseInt(String(data?.resourcePoints || "0"), 10) || 0} | resource die ${summarizeForPrompt(String(data?.resourceDie || "d4"), 8)} | consumption ${Math.max(0, Number.parseInt(String(data?.consumption || "0"), 10) || 0)} | commodities F:${Number.parseInt(String(commodities.food || "0"), 10) || 0} L:${Number.parseInt(String(commodities.lumber || "0"), 10) || 0} Lux:${Number.parseInt(String(commodities.luxuries || "0"), 10) || 0} O:${Number.parseInt(String(commodities.ore || "0"), 10) || 0} S:${Number.parseInt(String(commodities.stone || "0"), 10) || 0}`,
+    `- Pressure: unrest ${Math.max(0, Number.parseInt(String(data?.unrest || "0"), 10) || 0)} | renown ${Math.max(0, Number.parseInt(String(data?.renown || "0"), 10) || 0)} | fame ${Math.max(0, Number.parseInt(String(data?.fame || "0"), 10) || 0)} | infamy ${Math.max(0, Number.parseInt(String(data?.infamy || "0"), 10) || 0)} | ruin C:${Math.max(0, Number.parseInt(String(ruin.corruption || "0"), 10) || 0)} Cr:${Math.max(0, Number.parseInt(String(ruin.crime || "0"), 10) || 0)} D:${Math.max(0, Number.parseInt(String(ruin.decay || "0"), 10) || 0)} S:${Math.max(0, Number.parseInt(String(ruin.strife || "0"), 10) || 0)} / threshold ${Math.max(1, Number.parseInt(String(ruin.threshold || "5"), 10) || 5)}`,
+    `- Rules profile: ${summarizeForPrompt(String(profile?.label || "Kingdom profile"), 90)} | ${summarizeForPrompt(String(profile?.summary || ""), compactContext ? 180 : 260)}`,
+  ];
+  const turnStructure = Array.isArray(profile?.turnStructure) ? profile.turnStructure : [];
+  if (turnStructure.length) {
+    lines.push(
+      `- Turn structure: ${turnStructure
+        .slice(0, compactContext ? 4 : 5)
+        .map((entry) => `${summarizeForPrompt(String(entry || ""), compactContext ? 60 : 90)}`)
+        .join(" | ")}`
+    );
+  }
+  const aiSummary = Array.isArray(profile?.aiSummary)
+    ? profile.aiSummary
+    : Array.isArray(profile?.aiContextSummary)
+      ? profile.aiContextSummary
+      : [];
+  if (aiSummary.length) {
+    lines.push(
+      `- Kingdom AI guide: ${aiSummary
+        .slice(0, compactContext ? 4 : 6)
+        .map((entry) => summarizeForPrompt(String(entry || ""), compactContext ? 80 : 120))
+        .join(" | ")}`
+    );
+  }
+  const leaderLines = leaders
+    .slice(0, compactContext ? 5 : 8)
+    .map((leader) => {
+      const name = summarizeForPrompt(String(leader?.name || ""), 40);
+      const role = summarizeForPrompt(String(leader?.role || ""), 28);
+      const type = summarizeForPrompt(String(leader?.type || ""), 8);
+      const skills = summarizeForPrompt(String(leader?.specializedSkills || ""), compactContext ? 60 : 90);
+      return `- Leader: ${role || "Role"} = ${name || "Unassigned"}${type ? ` (${type})` : ""}${skills ? ` | specialized: ${skills}` : ""}`;
+    })
+    .filter(Boolean);
+  const settlementLines = settlements
+    .slice(0, compactContext ? 4 : 6)
+    .map((settlement) => {
+      const name = summarizeForPrompt(String(settlement?.name || ""), 40);
+      const size = summarizeForPrompt(String(settlement?.size || ""), 20);
+      const structure = summarizeForPrompt(String(settlement?.civicStructure || ""), 28);
+      return `- Settlement: ${name || "Unnamed"}${size ? ` (${size})` : ""}${structure ? ` | civic: ${structure}` : ""} | influence ${Math.max(0, Number.parseInt(String(settlement?.influence || "0"), 10) || 0)} | dice ${Math.max(0, Number.parseInt(String(settlement?.resourceDice || "0"), 10) || 0)}`;
+    })
+    .filter(Boolean);
+  const regionLines = regions
+    .slice(0, compactContext ? 5 : 8)
+    .map((region) => {
+      const hex = summarizeForPrompt(String(region?.hex || ""), 24);
+      const terrain = summarizeForPrompt(String(region?.terrain || ""), 24);
+      const workSite = summarizeForPrompt(String(region?.workSite || ""), 30);
+      return `- Region: ${hex || "Unknown"} | ${summarizeForPrompt(String(region?.status || ""), 24) || "status unknown"}${terrain ? ` | terrain: ${terrain}` : ""}${workSite ? ` | work site: ${workSite}` : ""}`;
+    })
+    .filter(Boolean);
+  const turnLines = recentTurns
+    .slice(0, compactContext ? 3 : 5)
+    .map((turn) => {
+      const title = summarizeForPrompt(String(turn?.title || ""), 36);
+      const summary = summarizeForPrompt(String(turn?.summary || ""), compactContext ? 90 : 140);
+      return `- Recent turn: ${title || "Turn"}${summary ? ` | ${summary}` : ""}`;
+    })
+    .filter(Boolean);
+  const projectLines = (Array.isArray(data?.pendingProjects) ? data.pendingProjects : [])
+    .slice(0, compactContext ? 4 : 6)
+    .map((entry) => `- Pending: ${summarizeForPrompt(String(entry || ""), compactContext ? 100 : 140)}`)
+    .filter(Boolean);
+  const notes = summarizeForPrompt(String(data?.notes || ""), compactContext ? 180 : 280);
+  if (leaderLines.length) lines.push(...leaderLines);
+  if (settlementLines.length) lines.push(...settlementLines);
+  if (regionLines.length) lines.push(...regionLines);
+  if (turnLines.length) lines.push(...turnLines);
+  if (projectLines.length) lines.push(...projectLines);
+  if (notes) lines.push(`- Kingdom notes: ${notes}`);
+  return lines;
+}
+
+function getDefaultKingdomRulesProfile() {
+  const profiles = Array.isArray(KINGDOM_RULES_DATA?.profiles) ? KINGDOM_RULES_DATA.profiles : [];
+  const wanted = String(KINGDOM_RULES_DATA?.latestProfileId || "").trim();
+  if (wanted) {
+    const match = profiles.find((profile) => String(profile?.id || "").trim() === wanted);
+    if (match) return match;
+  }
+  return profiles[0] || { label: "Kingdom profile", summary: "", turnStructure: [], aiContextSummary: [] };
+}
+
+function getModeSpecificPromptLines(mode, input, context = null) {
+  const activeTab = String(context?.activeTab || "").toLowerCase();
+  if (String(mode || "").toLowerCase() === "npc") {
+    const lines = [
+      "Format requirements:",
+      "Return exactly these top-level labels: Name, Role, Agenda, Disposition, Notes.",
+      "Under Notes include 6 to 8 short bullets covering core want, leverage, current pressure or fear, voice and mannerisms, first impression or look, hidden truth or complication, and best way to use them in the next session.",
+    ];
+    const lowerInput = String(input || "").toLowerCase();
+    if (/\b(few|several|multiple|some|2|3|4)\b/.test(lowerInput) && /\bnpcs?\b/.test(lowerInput)) {
+      lines.push("If the GM asks for multiple NPCs, return 2 to 4 NPC blocks separated by a line containing only ---.");
+    }
+    if (String(context?.selectedPdfFile || "").trim() && isPdfGroundedQuestion(lowerInput)) {
+      lines.push(
+        "Book-grounding requirement: base the NPCs on the selected PDF context. Prefer named or clearly implied figures from that book, and mark any inferred role as inferred instead of inventing unsupported lore."
+      );
+    }
+    return lines;
+  }
+  if (activeTab === "kingdom") {
+    return [
+      "Kingdom workflow requirements:",
+      "Base advice on the current kingdom sheet and the active V&K rules profile before inventing new plans.",
+      "When you suggest changes, make the consequences and tradeoffs explicit so the GM can decide whether to update the records.",
+      "Prefer outputs that help the GM record the turn cleanly: action order, what changed, risks, and what should be saved into DM Helper.",
+    ];
+  }
+  return [];
 }
 
 function finalizeAiOutput({ rawText, mode, input, tabId }) {
@@ -1343,6 +2355,120 @@ function sanitizeAiTextOutput(rawText) {
   return cleaned.join("\n").trim();
 }
 
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractLabeledBlock(text, label) {
+  const source = String(text || "");
+  if (!source) return "";
+  const regex = new RegExp(`${escapeRegex(label)}\\s*:\\s*([\\s\\S]*?)(?=\\n[A-Za-z][A-Za-z ]{1,28}:|$)`, "i");
+  const match = source.match(regex);
+  return match ? String(match[1] || "").trim() : "";
+}
+
+function collectNpcSupplementalDetailLines(text) {
+  const fieldMap = [
+    ["Core Want", "Core want"],
+    ["Want", "Core want"],
+    ["Goal", "Core want"],
+    ["Leverage", "Leverage"],
+    ["Pressure", "Current pressure"],
+    ["Fear", "Current pressure"],
+    ["Voice", "Voice and mannerisms"],
+    ["Mannerisms", "Voice and mannerisms"],
+    ["First Impression", "First impression or look"],
+    ["Appearance", "First impression or look"],
+    ["Look", "First impression or look"],
+    ["Secret", "Hidden truth or complication"],
+    ["Hidden Truth", "Hidden truth or complication"],
+    ["Complication", "Hidden truth or complication"],
+    ["Hook", "Best way to use them in the next session"],
+    ["Use At Table", "Best way to use them in the next session"],
+    ["Use in Next Session", "Best way to use them in the next session"],
+  ];
+  const seenTitles = new Set();
+  const lines = [];
+  for (const [label, title] of fieldMap) {
+    const value = extractLabeledBlock(text, label).replace(/\s*\n+\s*/g, " ").trim();
+    if (!value || seenTitles.has(title.toLowerCase())) continue;
+    seenTitles.add(title.toLowerCase());
+    lines.push(`- ${title}: ${value}`);
+  }
+  return lines;
+}
+
+function buildNpcNotesFromAi(text) {
+  const baseNotes = extractLabeledBlock(text, "Notes");
+  const extraLines = collectNpcSupplementalDetailLines(text);
+  if (!baseNotes && !extraLines.length) return "";
+  if (!baseNotes) return extraLines.join("\n");
+
+  const existing = baseNotes.toLowerCase();
+  const freshLines = extraLines.filter((line) => !existing.includes(line.replace(/^- /, "").split(":")[0].toLowerCase()));
+  return [baseNotes, freshLines.join("\n")].filter(Boolean).join("\n");
+}
+
+function isWeakNpcOutput(text) {
+  const name = extractLabeledBlock(text, "Name");
+  const role = extractLabeledBlock(text, "Role");
+  const agenda = extractLabeledBlock(text, "Agenda");
+  const disposition = extractLabeledBlock(text, "Disposition");
+  const notes = buildNpcNotesFromAi(text);
+  if (!name || !role || !agenda || !disposition || !notes) return true;
+
+  const noteLines = splitAiLines(notes);
+  const bulletCount = noteLines.filter((line) => /^[-*]\s+/.test(line)).length;
+  const noteChars = notes.replace(/\s+/g, " ").trim().length;
+  if (noteChars < 110) return true;
+  if (bulletCount > 0 && bulletCount < 4) return true;
+  return false;
+}
+
+function countBulletLikeLines(text) {
+  return splitAiLines(text).filter((line) => /^[-*]\s+/.test(line) || /^\d+[.)]\s+/.test(line)).length;
+}
+
+function isClearlyTruncatedOutput(text) {
+  const clean = String(text || "").trim();
+  if (!clean) return true;
+  const lines = splitAiLines(clean);
+  const lastLine = lines[lines.length - 1] || clean;
+  if (/[:\-]\s*$/.test(lastLine)) return true;
+  if (/[.!?]$/.test(lastLine)) return false;
+  const lastWord = String(lastLine || "").toLowerCase().split(/\s+/).filter(Boolean).pop() || "";
+  if (
+    [
+      "a",
+      "an",
+      "the",
+      "and",
+      "or",
+      "to",
+      "of",
+      "in",
+      "on",
+      "with",
+      "for",
+      "from",
+      "is",
+      "are",
+      "was",
+      "were",
+      "that",
+      "this",
+      "these",
+      "those",
+      "as",
+      "at",
+      "by",
+    ].includes(lastWord)
+  ) {
+    return true;
+  }
+  return lines.length <= 2 && clean.length < 160;
+}
+
 function isLikelyWeakAiOutput(text, mode, input, tabId) {
   const clean = String(text || "").trim();
   if (!clean) return true;
@@ -1369,6 +2495,21 @@ function isLikelyWeakAiOutput(text, mode, input, tabId) {
     clean.length < 160
   ) {
     return true;
+  }
+
+  if ((String(mode || "").toLowerCase() === "npc" || tabId === "npcs") && isWeakNpcOutput(clean)) {
+    return true;
+  }
+
+  if (isClearlyTruncatedOutput(clean)) {
+    return true;
+  }
+
+  if (isPdfGroundedQuestion(lowerInput)) {
+    if (clean.length < 180) return true;
+    if (/\b(give me 5 ways|five ways|5 ways to run|ways to run)\b/.test(lowerInput) && countBulletLikeLines(clean) < 3) {
+      return true;
+    }
   }
 
   if (String(mode || "").toLowerCase() !== "assistant" && clean.length < 24) return true;
@@ -1492,7 +2633,20 @@ function generateFallbackAiOutput(mode, input, tabId) {
     return buildRecapFallback(cleanInput || "The party advanced their goals and uncovered a new threat.");
   }
   if (normalizedMode === "npc") {
-    return `NPC Brief: ${ensureSentence(cleanInput || "This NPC has a clear goal and visible pressure in the current scene")}`;
+    return [
+      "Name: Frontier Broker",
+      "Role: Local fixer with contested loyalties",
+      "Agenda: Stay useful to the party while concealing one damaging alliance",
+      "Disposition: Helpful, but always measuring the cost",
+      "Notes:",
+      "- Core want: Survive the current power struggle without losing access or credibility.",
+      "- Leverage over the party or locals: Knows the fastest route to the next lead and who is lying about it.",
+      "- Current pressure or fear: A stronger faction is about to call in a favor they cannot safely refuse.",
+      "- Voice and mannerisms: Speaks quietly, answers sideways first, and watches who reacts to every name.",
+      "- First impression or look: Well-kept gear, tired eyes, and the posture of someone who expects betrayal.",
+      "- Hidden truth or complication: Already helped the wrong people once and is trying to keep that buried.",
+      "- Best way to use them in the next session: Make them the quickest path to progress, then reveal their complication when the party commits.",
+    ].join("\n");
   }
   if (normalizedMode === "quest") {
     return `Objective: ${ensureSentence(cleanInput || "Advance the active quest with one clear obstacle and one consequence for delay")}`;
@@ -1562,13 +2716,41 @@ function generateCopilotFallbackByTab(tabId, input) {
       "- Push key entries into the latest session log.",
     ].join("\n");
   }
+  if (tabId === "kingdom") {
+    return [
+      "Kingdom Turn Focus:",
+      "- Confirm Control DC, unrest, ruin, and consumption before spending actions.",
+      "- Assign specialized leader actions first, then use flexible actions to cover gaps.",
+      "- Check whether any civic structure, construction project, or event needs to resolve this turn.",
+      "",
+      "Recommended Action Order:",
+      "1. Resolve Upkeep changes, including leadership gaps and automatic kingdom effects.",
+      "2. Spend leader and settlement actions on the safest high-value activities for this turn.",
+      "3. Record RP, commodities, unrest, ruin, renown, fame, infamy, and pending construction changes.",
+      "",
+      "Risks To Watch:",
+      "- Rising unrest or ruin near the threshold can make the next event spiral fast.",
+      "- Consumption and local settlement limits can quietly punish overexpansion.",
+      "",
+      "What To Record In DM Helper:",
+      "- Which leaders acted, what changed, and which projects are still pending.",
+      "- Any rulings or reminders you need before the next kingdom turn.",
+    ].join("\n");
+  }
   if (tabId === "npcs") {
     return [
       "Name: Frontier Contact",
       "Role: Information broker",
       "Agenda: Gain leverage over local factions",
       "Disposition: Cautiously allied",
-      "Notes: Speaks in clipped sentences and trades favors, not coin.",
+      "Notes:",
+      "- Core want: Stay indispensable to every side without becoming owned by any one faction.",
+      "- Leverage over the party or locals: Holds a name, route, or hidden meeting place the party needs.",
+      "- Current pressure or fear: One local faction suspects they are selling information twice.",
+      "- Voice and mannerisms: Speaks in clipped sentences and never answers the exact question first.",
+      "- First impression or look: Polished boots, travel cloak, and the calm posture of someone who expects trouble.",
+      "- Hidden truth or complication: Their best source is a person the party would not trust on sight.",
+      "- Best way to use them in the next session: Introduce them as the fastest path to a lead, then make the price for help social rather than monetary.",
     ].join("\n");
   }
   if (tabId === "quests") {
@@ -1590,11 +2772,12 @@ function generateCopilotFallbackByTab(tabId, input) {
   }
   if (tabId === "pdf") {
     return [
-      "Query: frontier road spirit threat",
+      "Book Context Status: No PDF-grounded answer was generated here. This is a built-in fallback.",
+      "Query: adventure summary opening chapter",
       "Backup Queries:",
-      "- cursed road encounter design",
-      "- low level incorporeal enemy tactics",
-      "Why: These terms find practical encounter and rules references quickly.",
+      "- main threat final chapter",
+      "- important NPCs clues chapter one",
+      "Why: Summarize the book or search for the specific section you want before asking again.",
     ].join("\n");
   }
   if (tabId === "foundry") {
@@ -1617,6 +2800,7 @@ function generateAssistantFallbackAnswer(input) {
       "Tell me what you want right now:",
       "- prep plan",
       "- encounter idea",
+      "- kingdom turn help",
       "- NPC or quest help",
       "- cleanup of rough notes",
     ].join("\n");
@@ -1624,7 +2808,7 @@ function generateAssistantFallbackAnswer(input) {
   if (/\b(who|what)\s+are\s+you\b/.test(lower)) {
     return [
       "I am your DM Helper Loremaster running on your local AI setup.",
-      "I can help with hooks, session prep, encounters, NPCs, quests, and note cleanup.",
+      "I can help with hooks, session prep, kingdom turns, encounters, NPCs, quests, and note cleanup.",
       "Ask me for one specific thing and I will draft it in table-ready format.",
     ].join("\n");
   }
@@ -1632,6 +2816,7 @@ function generateAssistantFallbackAnswer(input) {
     return [
       "I can help right now with:",
       "- Session hook ideas",
+      "- Kingdom turn planning and record updates",
       "- Encounter setup (objective, obstacle, consequence)",
       "- NPC or quest drafts",
       "- Cleanup of rough notes into clean prep text",
@@ -1787,6 +2972,14 @@ function getIndexedPdfFileNamesFromContext(context, limit = 30) {
   return names.slice(0, max);
 }
 
+function isPdfGroundedQuestion(inputText) {
+  const lower = String(inputText || "").toLowerCase().trim();
+  if (!lower) return false;
+  return /\b(selected pdf|this book|the book|book|pdf|adventure|module|chapter|section|main threat|run chapter|run it|run this)\b/.test(
+    lower
+  );
+}
+
 function isSourceScopeQuestion(text) {
   const lower = String(text || "").toLowerCase().trim();
   if (!lower) return false;
@@ -1840,30 +3033,80 @@ function maybeBuildSourceScopeReply(mode, input, context = null) {
   return lines.join("\n");
 }
 
-function collectPdfContextForAi(query, limit = 6) {
+function findIndexedPdfFileByName(fileName) {
+  const target = String(fileName || "").trim().toLowerCase();
+  if (!target) return null;
+  return pdfIndexCache.files.find((file) => String(file?.fileName || "").trim().toLowerCase() === target) || null;
+}
+
+function buildSelectedPdfPreview(fileName, maxChars = 1200) {
+  const file = findIndexedPdfFileByName(fileName);
+  if (!file) return "";
+  const pages = getIndexedPages(file).slice(0, 3);
+  const combined = pages.map((page) => normalizePdfText(page.text)).filter(Boolean).join(" ");
+  return summarizeForPrompt(combined, Math.max(240, Number(maxChars) || 1200));
+}
+
+function collectSelectedPdfFallbackContext(fileName, query, limit = 6) {
+  const file = findIndexedPdfFileByName(fileName);
+  if (!file) return [];
+  const pages = getIndexedPages(file);
+  if (!pages.length) return [];
+
+  const max = Math.max(1, Math.min(Number(limit) || 6, 12));
+  const lowerQuery = String(query || "").toLowerCase();
+  const wantsChapterOne = /\b(chapter\s*1|chapter one|opening|first chapter|start of the book)\b/.test(lowerQuery);
+  const wantsThreat = /\b(threat|villain|antagonist|enemy|danger|main problem|main conflict)\b/.test(lowerQuery);
+  const seen = new Set();
+  const ranked = [];
+
+  function addPage(page, score, pattern = null) {
+    if (!page?.text || seen.has(page.page)) return;
+    seen.add(page.page);
+    const textLower = String(page.textLower || page.text.toLowerCase());
+    const hit = pattern ? textLower.search(pattern) : -1;
+    ranked.push({
+      fileName: file.fileName,
+      page: page.page,
+      score,
+      snippet: makeSnippet(page.text, hit),
+    });
+  }
+
+  const chapterPattern = /\b(chapter\s*1|chapter one|introduction|overview|adventure summary|background|part 1)\b/i;
+  const threatPattern = /\b(threat|villain|antagonist|enemy|danger|cult|mastermind|plot|menace)\b/i;
+
+  for (const page of pages.slice(0, 2)) {
+    addPage(page, 40);
+  }
+  if (wantsChapterOne) {
+    for (const page of pages) {
+      if (chapterPattern.test(page.text)) addPage(page, 90, chapterPattern);
+      if (ranked.length >= max) break;
+    }
+  }
+  if (wantsThreat) {
+    for (const page of pages) {
+      if (threatPattern.test(page.text)) addPage(page, 85, threatPattern);
+      if (ranked.length >= max) break;
+    }
+  }
+  for (const page of pages.slice(2)) {
+    addPage(page, 20);
+    if (ranked.length >= max) break;
+  }
+
+  ranked.sort((a, b) => b.score - a.score || a.page - b.page);
+  return ranked.slice(0, max);
+}
+
+async function collectPdfContextForAi(query, limit = 6, options = {}) {
   const searchParts = buildSearchParts(query);
   const longWords = searchParts.words.filter((word) => word.length >= 4);
   if (!longWords.length && !searchParts.phrase) return [];
-  const aiSearchParts = {
-    phrase: searchParts.phrase,
-    words: longWords,
-  };
-
-  const ranked = [];
-  for (const file of pdfIndexCache.files) {
-    const pages = getIndexedPages(file);
-    for (const page of pages) {
-      const match = scoreTextAgainstQuery(page.textLower, aiSearchParts);
-      if (!match.score) continue;
-      ranked.push({
-        fileName: file.fileName,
-        page: page.page,
-        score: match.score,
-        snippet: makeSnippet(page.text, match.firstHit),
-      });
-    }
-  }
-
-  ranked.sort((a, b) => b.score - a.score || a.fileName.localeCompare(b.fileName) || a.page - b.page);
-  return ranked.slice(0, Math.max(1, Math.min(limit, 12)));
+  const result = await searchIndexedPdfHybrid(query, Math.max(1, Math.min(Number(limit) || 6, 12)), {
+    config: options?.config,
+    preferredFileName: options?.preferredFileName,
+  });
+  return Array.isArray(result?.results) ? result.results.slice(0, Math.max(1, Math.min(Number(limit) || 6, 12))) : [];
 }

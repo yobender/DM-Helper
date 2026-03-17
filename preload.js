@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld("kmDesktop", {
   getPdfIndexSummary: () => ipcRenderer.invoke("pdf:get-index-summary"),
   pickPdfFolder: () => ipcRenderer.invoke("pdf:pick-folder"),
   indexPdfFolder: (folderPath) => ipcRenderer.invoke("pdf:index-folder", folderPath),
-  searchPdf: ({ query, limit }) => ipcRenderer.invoke("pdf:search", { query, limit }),
+  searchPdf: ({ query, limit, config }) => ipcRenderer.invoke("pdf:search", { query, limit, config }),
   summarizePdfFile: (payload) => ipcRenderer.invoke("pdf:summarize-file", payload),
   onPdfSummarizeProgress: (handler) => {
     if (typeof handler !== "function") return () => {};

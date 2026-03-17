@@ -531,6 +531,93 @@ textarea {
   text-overflow: ellipsis;
 }
 
+.copilot-chatlog {
+  margin: 0 0 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fffefb;
+  max-height: 34vh;
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.copilot-chatlog-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(199, 173, 126, 0.35);
+}
+
+.copilot-chatturn {
+  display: flex;
+}
+
+.copilot-chatturn.user {
+  justify-content: flex-end;
+}
+
+.copilot-chatturn.assistant,
+.copilot-chatturn.pending {
+  justify-content: flex-start;
+}
+
+.copilot-chatbubble {
+  width: min(100%, 94%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: #fff7ec;
+  box-shadow: 0 8px 18px rgba(62, 38, 17, 0.05);
+}
+
+.copilot-chatbubble.user {
+  background: rgba(47, 122, 99, 0.12);
+  border-color: rgba(47, 122, 99, 0.28);
+}
+
+.copilot-chatbubble.assistant {
+  background: #fffefb;
+}
+
+.copilot-chatbubble.pending {
+  background: #f5ecd8;
+  border-style: dashed;
+}
+
+.copilot-chatmeta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+
+.copilot-chatbody {
+  line-height: 1.5;
+}
+
+.copilot-chatbody p {
+  margin: 0 0 8px;
+}
+
+.copilot-chatbody p:last-child {
+  margin-bottom: 0;
+}
+
+.copilot-chatbody .session-readable-content {
+  padding: 0;
+  max-height: none;
+  overflow: visible;
+}
+
+.copilot-chatbody .prep-heading {
+  margin-top: 0;
+}
+
 .ai-history-list {
   margin-top: 8px;
   max-height: 170px;
@@ -645,6 +732,84 @@ textarea {
 .entry p {
   margin: 8px 0 0;
   line-height: 1.45;
+}
+
+.kingdom-page {
+  align-items: stretch;
+}
+
+.kingdom-profile-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(47, 122, 99, 0.12);
+  border: 1px solid rgba(47, 122, 99, 0.2);
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.kingdom-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #fff7ec;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.kingdom-overview-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.kingdom-guide-panel {
+  background: linear-gradient(180deg, rgba(255, 253, 248, 0.98) 0%, rgba(245, 235, 214, 0.95) 100%);
+}
+
+.kingdom-guide-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.kingdom-guide-section {
+  margin-top: 0;
+}
+
+.kingdom-guide-section summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.kingdom-guide-body {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.kingdom-guide-cards,
+.kingdom-advancement-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.kingdom-source-list {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
 }
 
 .session-edit-panel {
@@ -855,6 +1020,10 @@ textarea {
   }
 
   .sessions-step-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .kingdom-overview-grid {
     grid-template-columns: 1fr;
   }
 

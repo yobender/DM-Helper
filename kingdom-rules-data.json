@@ -1,0 +1,208 @@
+{
+  "loadedAt": "2026-03-16",
+  "latestProfileId": "vk-remastered-stacked",
+  "profiles": [
+    {
+      "id": "vk-remastered-stacked",
+      "label": "Vance & Kerenshara Remastered Kingdom Rules",
+      "shortLabel": "V&K Remastered",
+      "version": "2026-03-16",
+      "status": "active",
+      "summary": "This profile combines Vance & Kerenshara's original Pathfinder 2e Kingmaker patch with their later remastered changes. The remastered document explicitly assumes the original patch is already in place, so DM Helper treats both documents as one rules stack.",
+      "sources": [
+        {
+          "title": "Vance and Kerenshara's Comprehensive Pathfinder 2e Kingdom Building Rule Changes",
+          "url": "https://docs.google.com/document/d/1NHksCXkXbjtrv-26VgFHNbyYldatVwag9lM44IWxIXo/edit",
+          "role": "foundation patch"
+        },
+        {
+          "title": "Vance & Kerenshara's Remastered Kingdom Building Rules (Changes Only)",
+          "url": "https://docs.google.com/document/d/1CWQZMA5MZA8zDpG5QFWB-crF7j5LtfmV8nbRndOujg0/edit",
+          "role": "latest overlay"
+        },
+        {
+          "title": "Vance & Kerenshara's Remastered Kingdom Building Rules (with Discussion)",
+          "url": "https://docs.google.com/document/d/13pMPSwB0vTSOGVlCifgNDJIrD5PyzYQVqFeXUrNg5NY/edit",
+          "role": "design notes and rationale"
+        },
+        {
+          "title": "Paizo forum thread: Vance & Kerenshara's Remastered Kingdom Building Rules",
+          "url": "https://paizo.com/threads/rzs5xbzs?Vance-Kerensharas-Remastered-Kingdom",
+          "role": "latest public update trail"
+        }
+      ],
+      "automationNotes": [
+        "Use the original V&K patch as the base rules layer, then apply the remastered changes on top.",
+        "Keep the kingdom engine deterministic. AI should explain options, summarize consequences, and suggest turns, but not silently decide math.",
+        "When the rules are unclear, preserve current kingdom data and ask for a ruling rather than mutating records automatically.",
+        "Store the active rules profile id with the campaign so later rules updates do not silently rewrite old turns."
+      ],
+      "quickStart": [
+        "Create the kingdom sheet first: name, charter, government, heartland, capital, current level, size, resource die, and core kingdom stats.",
+        "Track leaders as actual roles with notes on whether they are PCs, NPCs, and which skills make them good leaders.",
+        "Track at least one settlement record and claimed regions/hexes before running a kingdom turn.",
+        "Before each turn, check control DC, resource die, consumption, unrest, ruin, renown, fame, infamy, commodities, and any ongoing construction.",
+        "Run turns in the remastered order: Upkeep, Activities, Construction, Event.",
+        "Use the guide section in-app when you are unsure whether an action is local to a settlement, tied to a hex, or limited to once per turn."
+      ],
+      "turnStructure": [
+        {
+          "phase": "Upkeep",
+          "summary": "Apply start-of-turn changes, including leadership assignments, unrest adjustments, automatic kingdom changes, and start-of-turn renown."
+        },
+        {
+          "phase": "Activities",
+          "summary": "The old commerce, leadership, region, and civic substeps are condensed. Each PC leader gets 3 actions, each NPC leader gets 2, and settlements with civic structures get their own turns."
+        },
+        {
+          "phase": "Construction",
+          "summary": "Optional but recommended in this profile. Spend ongoing RP on unfinished structures and finish projects that were started on previous turns."
+        },
+        {
+          "phase": "Event",
+          "summary": "Resolve the kingdom event. Critical failures on events now add unrest if they do not already do so."
+        }
+      ],
+      "actionLimits": [
+        "Each commerce activity is limited to once per kingdom turn.",
+        "Each specific region activity can only be attempted once per turn per hex.",
+        "A leadership action used for civic work is normally limited to one civic activity per settlement per turn unless a civic structure expands that limit.",
+        "Unless a rule says otherwise, each leader can only attempt a given activity once per turn."
+      ],
+      "creationChanges": [
+        "Charter and heartland each grant both a fixed trained skill and a free trained skill.",
+        "Kingdom creation gains an extra free ability boost, bringing the free boosts at creation to three.",
+        "Instead of each invested leader choosing a trained skill during creation, the kingdom selects four additional trained skills directly, for a total of ten trained skills at the start."
+      ],
+      "advancement": [
+        { "level": 1, "controlDC": 14, "features": ["Charter", "Government", "Heartland", "Initial proficiencies", "Favored land", "Village construction"] },
+        { "level": 2, "controlDC": 15, "features": ["Kingdom feat", "Skill increase", "Untrained Improvisation"] },
+        { "level": 3, "controlDC": 16, "features": ["Town construction", "Skill increase"] },
+        { "level": 4, "controlDC": 18, "features": ["Expansion expert", "Fine living", "Kingdom feat", "Skill increase"] },
+        { "level": 5, "controlDC": 20, "features": ["Three ability boosts", "Ruin resistance", "Skill increase"] },
+        { "level": 6, "controlDC": 22, "features": ["Kingdom feat", "Skill increase"] },
+        { "level": 7, "controlDC": 23, "features": ["Skill increase", "Untrained Improvisation at full level"] },
+        { "level": 8, "controlDC": 24, "features": ["Experienced leadership +2", "Kingdom feat", "Ruin resistance", "Skill increase"] },
+        { "level": 9, "controlDC": 26, "features": ["Claim Hex 3 times per turn", "City construction", "Skill increase"] },
+        { "level": 10, "controlDC": 27, "features": ["Three ability boosts", "Kingdom feat", "Life of luxury", "Skill increase"] },
+        { "level": 11, "controlDC": 28, "features": ["Ruin resistance", "Skill increase"] },
+        { "level": 12, "controlDC": 30, "features": ["Civic planning", "Kingdom feat", "Skill increase"] },
+        { "level": 13, "controlDC": 31, "features": ["Skill increase"] },
+        { "level": 14, "controlDC": 32, "features": ["Kingdom feat", "Ruin resistance", "Skill increase"] },
+        { "level": 15, "controlDC": 34, "features": ["Three ability boosts", "Metropolis construction", "Skill increase"] },
+        { "level": 16, "controlDC": 35, "features": ["Experienced leadership +3", "Kingdom feat", "Skill increase"] },
+        { "level": 17, "controlDC": 36, "features": ["Ruin resistance", "Skill increase"] },
+        { "level": 18, "controlDC": 38, "features": ["Kingdom feat", "Skill increase"] },
+        { "level": 19, "controlDC": 39, "features": ["Skill increase"] },
+        { "level": 20, "controlDC": 40, "features": ["Three ability boosts", "Envy of the world", "Kingdom feat", "Ruin resistance", "Skill increase"] }
+      ],
+      "mathAdjustments": [
+        "Skill increases happen every level from level 2 onward.",
+        "Untrained Improvisation starts at level 2 and reaches full level at level 7.",
+        "Consumption for kingdoms, settlements, and armies can never be negative.",
+        "Ruin threshold is reduced from 10 to 5 in the remastered layer.",
+        "Critical failures add ruin tied to the skill's linked attribute, even if the roll is rerolled with renown.",
+        "Critical failures on events add unrest when the event result would not already do so."
+      ],
+      "leadershipRules": [
+        "Base invested-leadership status bonuses are replaced by Leadership Bonus tied to the actual leader's skills.",
+        "A leader gains +1 Leadership Bonus if trained in at least two relevant skills for the role, +2 at expert, +3 at master, and +4 at legendary.",
+        "Each role has specialized kingdom skills. Checks with specialized skills use the full Leadership Bonus.",
+        "Checks outside specialized skills require one extra action and only gain half the usual Leadership Bonus, rounded down.",
+        "PC leaders gain one extra specialized kingdom skill of their choice.",
+        "Regular and highly motivated NPC leaders can use default Leadership Bonus progressions if they are not fully statted."
+      ],
+      "leadershipRoles": [
+        { "role": "Ruler", "relevantSkills": ["Diplomacy", "Deception", "Intimidation", "Performance", "Society", "Heraldry Lore", "Politics Lore", "Ruler Lore"], "specializedSkills": ["Industry", "Intrigue", "Politics", "Statecraft", "Warfare"] },
+        { "role": "Counselor", "relevantSkills": ["Diplomacy", "Deception", "Performance", "Religion", "Society", "Academia Lore", "Art Lore", "Counselor Lore"], "specializedSkills": ["Arts", "Folklore", "Politics", "Scholarship", "Trade"] },
+        { "role": "Emissary", "relevantSkills": ["Diplomacy", "Deception", "Intimidation", "Stealth", "Thievery", "Politics Lore", "Underworld Lore", "Emissary Lore"], "specializedSkills": ["Intrigue", "Magic", "Politics", "Statecraft", "Trade"] },
+        { "role": "General", "relevantSkills": ["Diplomacy", "Athletics", "Crafting", "Intimidation", "Survival", "Scouting Lore", "Warfare Lore", "General Lore"], "specializedSkills": ["Boating", "Defense", "Engineering", "Exploration", "Warfare"] },
+        { "role": "Magister", "relevantSkills": ["Diplomacy", "Arcana", "Nature", "Occultism", "Religion", "Academia Lore", "Scribing Lore", "Magister Lore"], "specializedSkills": ["Defense", "Folklore", "Magic", "Scholarship", "Wilderness"] },
+        { "role": "Treasurer", "relevantSkills": ["Diplomacy", "Crafting", "Medicine", "Society", "Thievery", "Labor Lore", "Mercantile Lore", "Treasurer Lore"], "specializedSkills": ["Arts", "Boating", "Industry", "Intrigue", "Trade"] },
+        { "role": "Viceroy", "relevantSkills": ["Diplomacy", "Crafting", "Medicine", "Nature", "Society", "Architecture Lore", "Engineering Lore", "Viceroy Lore"], "specializedSkills": ["Agriculture", "Engineering", "Industry", "Scholarship", "Wilderness"] },
+        { "role": "Warden", "relevantSkills": ["Diplomacy", "Athletics", "Nature", "Stealth", "Survival", "Farming Lore", "Hunting Lore", "Warden Lore"], "specializedSkills": ["Agriculture", "Boating", "Defense", "Exploration", "Wilderness"] }
+      ],
+      "economyAndXP": [
+        "The original patch adds more early and midgame kingdom XP through milestones, per-hex rewards, and RP-to-XP tuning.",
+        "The remastered layer adds XP for additional farms and work sites, roads and bridges beyond the first, and structures based on RP spent, with edifice structures worth double.",
+        "Each settlement of city size or greater generates 1 resource die per turn in the remastered layer.",
+        "Renown is the turn-by-turn reroll currency. Fame and Infamy become long-term tracks that rise over time instead of being spent every turn.",
+        "Every 10 Fame lowers peaceful negotiation DCs by 1. Every 10 Infamy lowers hostile negotiation DCs by 1 and raises peaceful negotiation DCs by 1."
+      ],
+      "activitiesAdded": [
+        {
+          "name": "Take Charge",
+          "source": "initial patch",
+          "summary": "Choose a trained kingdom skill and attempt a basic check. Success gains 1 RP; critical success also grants a +1 circumstance bonus on the next check using that skill this turn."
+        },
+        {
+          "name": "Reconnoiter Hex",
+          "source": "initial patch",
+          "summary": "Spend 1 RP and attempt a basic check to survey a hex. Success marks the hex as reconnoitered for Claim Hex and can reveal or report on features, hazards, or encounters."
+        },
+        {
+          "name": "Retrain",
+          "source": "remastered layer",
+          "summary": "A 2-action downtime leadership activity that lets the kingdom retrain a feat, skill increase, or leader specialized skill for RP and resource-die costs."
+        }
+      ],
+      "activitiesChanged": [
+        "Collect Taxes, Improve Lifestyle, Tap Treasury, Trade Commodities, and Manage Trade Agreements move out of Commerce Phase and into the Activity Phase, while staying limited to once per turn.",
+        "Focused Attention's DC is reduced to 15 and it no longer needs the extra action for non-specialized skills.",
+        "Celebrate Holiday can use Folklore or Politics and is limited to once per turn, affecting all holidays that month.",
+        "Clear Hex and Establish Settlement cannot be used on the same hex in the same turn.",
+        "New Leadership gives the appointed leader one fewer action on the turn they are appointed."
+      ],
+      "settlementRules": [
+        "The original patch allows the capital to grow one size category beyond normal level restrictions, though item bonus and influence caps do not jump early.",
+        "The remastered layer makes extra settlements mechanically worthwhile by giving civic structures extra actions and resource dice.",
+        "Town Hall, Castle, and Palace become civic structures that give settlement turns and more local build capacity instead of granting bonus leadership actions directly.",
+        "Town Hall gives 1 settlement action and can increase civic activity limit to 2.",
+        "Castle gives 2 settlement actions, can increase civic activity limit to 3, and can raise settlement resource dice at larger sizes.",
+        "Palace gives 2 settlement actions, can project building to another settlement, and is capital-only."
+      ],
+      "constructionRules": [
+        "Structures can take multiple turns to finish. Build Structure starts the project and later turns spend more RP during Construction Phase.",
+        "All commodity costs are paid on the turn construction begins.",
+        "The normal RP-per-structure-per-turn limit is twice the resource die size.",
+        "Edifice and Infrastructure structures use only one times the resource die size.",
+        "Residential structures use three times the resource die size.",
+        "Construction Yard raises the RP-per-turn cap for local projects."
+      ],
+      "structureBonuses": [
+        "Bank: +1 to Capital Investment and Collect Taxes.",
+        "Construction Yard: +1 to Build Roads and Irrigation in the original patch, and later also increases RP-per-turn construction capacity.",
+        "Festival Hall: +1 to Quell Unrest (Arts).",
+        "Garrison: +1 to Fortify Hex.",
+        "Granary: +1 to Establish Farmland and requires Agriculture (Trained) in the original patch.",
+        "Library: +1 to Creative Solution.",
+        "Magic Shop: +1 to Prognostication.",
+        "Monument: +1 to Create a Masterpiece.",
+        "Occult Shop: +2 to Supernatural Solution.",
+        "Town Hall: original patch gives +1 Manage Trade Agreements; remastered replaces this with +1 Manage Trade Agreements and Retrain while also granting civic actions.",
+        "Castle: original patch gives +2 Manage Trade Agreements and Relocate Capital; remastered expands this to +2 Manage Trade Agreements, New Leadership, Pledge of Fealty, Relocate Capital, Retrain, Send Diplomatic Envoy, and selected army actions.",
+        "Palace: original patch gives +3 Manage Trade Agreements and Relocate Capital; remastered expands this to +3 on the same expanded list as Castle.",
+        "Fishing Fleet: new remastered structure that reduces settlement consumption and supports Go Fishing / Rest and Relax using Boating."
+      ],
+      "clarifications": [
+        "Freeholds that join the kingdom before their hex is connected cause penalties and unrest until integrated properly.",
+        "Bridge, Landmark, Refuge, and Resource can overlap with other terrain features. Farmland, Freehold, Ruins, Settlement, Structure, and Work Site are the restricted list.",
+        "Ruins or structures in a hex can be incorporated into a settlement when the settlement is built there.",
+        "Structure effects that raise the item level available for purchase do not all stack freely; some stack only up to a cap."
+      ],
+      "aiContextSummary": [
+        "Use the V&K initial patch plus remastered changes as the campaign's kingdom rules baseline.",
+        "Answer kingdom questions with local, table-ready guidance and note when something is a GM ruling rather than a hard rule.",
+        "Prefer local settlement influence, leader specialization, resource dice, renown, fame, infamy, unrest, ruin, and ongoing construction when suggesting next actions.",
+        "When suggesting a kingdom turn, think in the order Upkeep, Activities, Construction, Event."
+      ],
+      "helpPrompts": [
+        "Using our V&K kingdom rules, plan my next kingdom turn.",
+        "Tell me which leader should handle each action this turn and why.",
+        "Given our unrest, ruin, and commodities, what is the safest kingdom turn this month?",
+        "Turn this settlement expansion plan into a step-by-step kingdom turn.",
+        "Using our kingdom profile, tell me what to prep before the next event phase."
+      ]
+    }
+  ]
+}

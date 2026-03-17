@@ -24,6 +24,7 @@ const tabs = [
   { id: "sessions", label: "Session Runner", group: "Run Game" },
   { id: "capture", label: "Live Capture HUD", group: "Run Game" },
   { id: "writing", label: "Writing Helper", group: "Run Game" },
+  { id: "kingdom", label: "Kingdom", group: "World" },
   { id: "npcs", label: "NPCs", group: "World" },
   { id: "quests", label: "Quests", group: "World" },
   { id: "locations", label: "Locations", group: "World" },
@@ -34,6 +35,7 @@ const tabs = [
 const tabGroups = ["Run Game", "World", "Tools"];
 
 const desktopApi = window.kmDesktop || null;
+const kingdomRulesData = await loadKingdomRulesData();
 
 let activeTab = "dashboard";
 let state = loadState();
@@ -49,6 +51,7 @@ const ui = {
   pdfSummaryProgressTotal: 0,
   pdfSummaryProgressLabel: "",
   sessionMessage: "",
+  kingdomMessage: "",
   customChecklistDraft: "",
   checklistAiBusy: false,
   aiBusy: false,
@@ -656,6 +659,53 @@ function wireGlobalEvents() {
       return;
     }
 
+    if (action === "ai-history-use-input") {
+      const turn = getAiHistoryEntryById(target.dataset.historyId);
+      if (!turn) {
+        ui.copilotMessage = "Saved conversation entry not found.";
+        render();
+        return;
+      }
+      ui.copilotDraft.input = str(turn.text);
+      ui.copilotMessage = `Loaded ${turn.role === "assistant" ? "AI" : "your"} message into the prompt.`;
+      render();
+      return;
+    }
+
+    if (action === "ai-history-load-output") {
+      const turn = getAiHistoryEntryById(target.dataset.historyId);
+      if (!turn || turn.role !== "assistant") {
+        ui.copilotMessage = "Only saved AI replies can be loaded into output.";
+        render();
+        return;
+      }
+      ui.copilotDraft.output = str(turn.text);
+      ui.copilotShowOutput = true;
+      ui.copilotMessage = "Loaded saved AI reply into the output panel.";
+      render();
+      return;
+    }
+
+    if (action === "ai-history-copy") {
+      const turn = getAiHistoryEntryById(target.dataset.historyId);
+      if (!turn) {
+        ui.copilotMessage = "Saved conversation entry not found.";
+        render();
+        return;
+      }
+      void navigator.clipboard.writeText(str(turn.text)).then(
+        () => {
+          ui.copilotMessage = "Saved conversation entry copied.";
+          render();
+        },
+        () => {
+          ui.copilotMessage = "Copy failed. Select the saved entry manually and copy.";
+          render();
+        }
+      );
+      return;
+    }
+
     if (action === "ai-copilot-seed") {
       ui.copilotDraft.input = buildGlobalCopilotSeedPrompt(activeTab);
       ui.copilotMessage = "Loaded a tab-specific prompt template.";
@@ -891,6 +941,7 @@ function render() {
   if (activeTab === "sessions") content = renderSessions();
   if (activeTab === "capture") content = renderCaptureHUD();
   if (activeTab === "writing") content = renderWritingHelper();
+  if (activeTab === "kingdom") content = renderKingdom();
   if (activeTab === "npcs") content = renderNpcs();
   if (activeTab === "quests") content = renderQuests();
   if (activeTab === "locations") content = renderLocations();
@@ -928,7 +979,8 @@ function renderTabLinks() {
 function renderGlobalAiCopilot() {
   const aiConfig = ensureAiConfig();
   const tabLabel = getTabLabel(activeTab);
-  const memoryTurns = getRecentAiHistory(activeTab, 10);
+  const memoryTurns = getRecentAiHistory(activeTab, 16);
+  const chatTurns = buildVisibleCopilotChatTurns(memoryTurns, ui.copilotDraft.output, ui.copilotBusy);
   const canSaveFallbackToMemory = !!ui.copilotPendingFallbackMemory?.text;
   const hasOutput = str(ui.copilotDraft.output).length > 0;
   const copilotBusy = ui.copilotBusy;
@@ -960,6 +1012,7 @@ function renderGlobalAiCopilot() {
           </div>
           <button class="btn btn-secondary" data-action="ai-copilot-toggle">Hide</button>
         </div>
+        ${renderCopilotChatLog(chatTurns, copilotBusy)}
         <label>Prompt
           <textarea class="copilot-prompt" data-copilot-field="input" placeholder="${escapeHtml(getGlobalCopilotPlaceholder(activeTab))}">${escapeHtml(
             ui.copilotDraft.input || ""
@@ -1040,14 +1093,7 @@ function renderGlobalAiCopilot() {
           </div>
           ${
             memoryTurns.length
-              ? `<ul class="list ai-history-list">${memoryTurns
-                  .map(
-                    (turn) =>
-                      `<li><strong>${escapeHtml(turn.role === "assistant" ? "AI" : "You")}:</strong> ${escapeHtml(
-                        compactLine(turn.text, 140)
-                      )}</li>`
-                  )
-                  .join("")}</ul>`
+              ? `<div class="ai-history-list">${memoryTurns.map((turn) => renderAiHistoryTurn(turn)).join("")}</div>`
               : `<p class="small">No saved conversation yet.</p>`
           }
         </details>
@@ -1058,6 +1104,98 @@ function renderGlobalAiCopilot() {
       </section>
     </div>
   `;
+}
+
+function buildVisibleCopilotChatTurns(memoryTurns, currentOutput, isBusy) {
+  const visible = Array.isArray(memoryTurns) ? [...memoryTurns] : [];
+  const latestAssistant = [...visible].reverse().find((turn) => turn.role === "assistant");
+  const outputText = str(currentOutput);
+  if (outputText && outputText !== str(latestAssistant?.text)) {
+    visible.push({
+      id: "copilot-preview",
+      role: "assistant",
+      text: outputText,
+      tabId: activeTab,
+      at: new Date().toISOString(),
+      ephemeral: true,
+    });
+  }
+  if (isBusy) {
+    visible.push({
+      id: "copilot-thinking",
+      role: "assistant",
+      text: "Thinking...",
+      tabId: activeTab,
+      at: new Date().toISOString(),
+      ephemeral: true,
+      pending: true,
+    });
+  }
+  return visible.slice(-12);
+}
+
+function renderCopilotChatLog(turns, isBusy = false) {
+  const chatTurns = Array.isArray(turns) ? turns : [];
+  return `
+    <section class="copilot-chatlog">
+      <div class="copilot-chatlog-head">
+        <strong>Chat</strong>
+        <span class="small">Follow-up prompts automatically use recent chat memory.</span>
+      </div>
+      ${
+        chatTurns.length
+          ? chatTurns.map((turn) => renderCopilotChatTurn(turn)).join("")
+          : `<p class="small">Ask a question here, then keep asking follow-ups like a normal chat.</p>`
+      }
+    </section>
+  `;
+}
+
+function renderCopilotChatTurn(turn) {
+  const role = turn.role === "assistant" ? "assistant" : "user";
+  const roleLabel = role === "assistant" ? "Loremaster" : "You";
+  const bubbleClass = turn.pending ? `${role} pending` : role;
+  const body = role === "assistant"
+    ? renderReadableContent(str(turn.text))
+    : `<p>${escapeHtml(str(turn.text)).replace(/\n/g, "<br />")}</p>`;
+  return `
+    <article class="copilot-chatturn ${bubbleClass}">
+      <div class="copilot-chatbubble ${bubbleClass}">
+        <div class="copilot-chatmeta">
+          <strong>${escapeHtml(roleLabel)}</strong>
+          <span class="small mono">${escapeHtml(formatAiHistoryTimestamp(turn.at) || "Now")}</span>
+        </div>
+        <div class="copilot-chatbody">${body}</div>
+      </div>
+    </article>
+  `;
+}
+
+function renderAiHistoryTurn(turn) {
+  const roleLabel = turn.role === "assistant" ? "AI" : "You";
+  const preview = compactLine(str(turn.text).replace(/\s+/g, " "), 150);
+  const tabLabel = getTabLabel(str(turn.tabId) || "dashboard");
+  const meta = [tabLabel, formatAiHistoryTimestamp(turn.at)].filter(Boolean).join(" • ");
+  const canLoadOutput = turn.role === "assistant";
+  return `
+    <details class="panel" style="margin-top:8px;">
+      <summary><strong>${escapeHtml(roleLabel)}</strong>: ${escapeHtml(preview)}${meta ? ` <span class="small">(${escapeHtml(meta)})</span>` : ""}</summary>
+      <div class="toolbar" style="margin-top:8px;">
+        <button class="btn btn-secondary" data-action="ai-history-use-input" data-history-id="${escapeHtml(turn.id)}">Use as Prompt</button>
+        <button class="btn btn-secondary" data-action="ai-history-copy" data-history-id="${escapeHtml(turn.id)}">Copy</button>
+        <button class="btn btn-secondary" data-action="ai-history-load-output" data-history-id="${escapeHtml(turn.id)}" ${
+          canLoadOutput ? "" : "disabled"
+        }>Load Output</button>
+      </div>
+      <textarea class="copilot-output" readonly style="margin-top:8px;min-height:140px;">${escapeHtml(str(turn.text))}</textarea>
+    </details>
+  `;
+}
+
+function formatAiHistoryTimestamp(value) {
+  const time = safeDate(value);
+  if (!Number.isFinite(time)) return "";
+  return new Date(time).toLocaleString();
 }
 
 function renderPageIntro(title, description) {
@@ -2023,6 +2161,1118 @@ function renderLocationDetails(location) {
   `;
 }
 
+async function loadKingdomRulesData() {
+  try {
+    const response = await fetch(new URL("./kingdom-rules-data.json", import.meta.url));
+    if (!response.ok) throw new Error(`Unable to load kingdom rules data (${response.status}).`);
+    const parsed = await response.json();
+    if (!Array.isArray(parsed?.profiles) || !parsed.profiles.length) throw new Error("No kingdom rules profiles found.");
+    return parsed;
+  } catch {
+    return createFallbackKingdomRulesData();
+  }
+}
+
+function createFallbackKingdomRulesData() {
+  return {
+    loadedAt: new Date().toISOString().slice(0, 10),
+    latestProfileId: "fallback",
+    profiles: [
+      {
+        id: "fallback",
+        label: "Kingdom Rules Profile",
+        shortLabel: "Kingdom",
+        version: "local-fallback",
+        status: "fallback",
+        summary: "Fallback kingdom rules profile used because the shared rules data file could not be loaded.",
+        sources: [],
+        automationNotes: [],
+        quickStart: ["Load the rules data file to unlock the full kingdom guide."],
+        turnStructure: [
+          { phase: "Upkeep", summary: "Review current kingdom state." },
+          { phase: "Activities", summary: "Assign actions and record outcomes." },
+          { phase: "Event", summary: "Resolve the kingdom event." }
+        ],
+        actionLimits: [],
+        creationChanges: [],
+        advancement: [],
+        mathAdjustments: [],
+        leadershipRules: [],
+        leadershipRoles: [],
+        economyAndXP: [],
+        activitiesAdded: [],
+        activitiesChanged: [],
+        settlementRules: [],
+        constructionRules: [],
+        structureBonuses: [],
+        clarifications: [],
+        aiContextSummary: [],
+        helpPrompts: []
+      }
+    ]
+  };
+}
+
+function getKingdomRulesProfiles() {
+  return Array.isArray(kingdomRulesData?.profiles) ? kingdomRulesData.profiles : [];
+}
+
+function getDefaultKingdomProfileId() {
+  const profiles = getKingdomRulesProfiles();
+  const wanted = str(kingdomRulesData?.latestProfileId);
+  if (wanted && profiles.some((profile) => profile.id === wanted)) return wanted;
+  return profiles[0]?.id || "fallback";
+}
+
+function getKingdomProfileById(profileId) {
+  const clean = str(profileId);
+  return getKingdomRulesProfiles().find((profile) => str(profile?.id) === clean) || getKingdomRulesProfiles()[0] || null;
+}
+
+function getActiveKingdomProfile() {
+  return getKingdomProfileById(state?.kingdom?.profileId || getDefaultKingdomProfileId());
+}
+
+function getControlDcForLevel(profile, level) {
+  const normalizedLevel = Math.max(1, Number.parseInt(String(level || "1"), 10) || 1);
+  const table = Array.isArray(profile?.advancement) ? profile.advancement : [];
+  return table.find((entry) => Number.parseInt(String(entry?.level || "0"), 10) === normalizedLevel)?.controlDC || 14;
+}
+
+function createStarterKingdomState() {
+  const profile = getKingdomProfileById(getDefaultKingdomProfileId());
+  return {
+    profileId: profile?.id || getDefaultKingdomProfileId(),
+    name: "Stolen Lands Charter",
+    charter: "Open charter",
+    government: "Council",
+    heartland: "Grassland",
+    capital: "TBD",
+    currentTurnLabel: "Turn 1",
+    currentDate: "",
+    level: 1,
+    size: 1,
+    controlDC: getControlDcForLevel(profile, 1),
+    resourceDie: "d4",
+    resourcePoints: 0,
+    xp: 0,
+    trainedSkills: ["Agriculture", "Politics", "Trade", "Wilderness"],
+    abilities: {
+      culture: 0,
+      economy: 0,
+      loyalty: 0,
+      stability: 0
+    },
+    commodities: {
+      food: 0,
+      lumber: 0,
+      luxuries: 0,
+      ore: 0,
+      stone: 0
+    },
+    consumption: 0,
+    renown: 1,
+    fame: 0,
+    infamy: 0,
+    unrest: 0,
+    ruin: {
+      corruption: 0,
+      crime: 0,
+      decay: 0,
+      strife: 0,
+      threshold: 5
+    },
+    notes: "Track capital growth, local influence, and construction queue here.",
+    leaders: [
+      {
+        id: uid(),
+        role: "Ruler",
+        name: "Unassigned",
+        type: "PC",
+        leadershipBonus: 1,
+        relevantSkills: "Diplomacy, Politics Lore",
+        specializedSkills: "Industry, Politics, Statecraft",
+        notes: "Set once the party chooses invested roles."
+      }
+    ],
+    settlements: [
+      {
+        id: uid(),
+        name: "Capital Site",
+        size: "Village",
+        influence: 1,
+        civicStructure: "Town Hall",
+        resourceDice: 0,
+        consumption: 0,
+        notes: "First permanent seat of government."
+      }
+    ],
+    regions: [
+      {
+        id: uid(),
+        hex: "A1",
+        status: "Claimed",
+        terrain: "Plains",
+        workSite: "",
+        notes: "Starting heartland."
+      }
+    ],
+    turns: [],
+    pendingProjects: [
+      "Choose all eight leadership roles.",
+      "Settle final charter / government / heartland choices in the sheet.",
+      "Create the first real settlement record once the capital is founded."
+    ]
+  };
+}
+
+function normalizeKingdomState(input) {
+  const base = createStarterKingdomState();
+  const out = {
+    ...base,
+    ...(input && typeof input === "object" ? input : {})
+  };
+  out.profileId = str(out.profileId) || base.profileId;
+  out.name = str(out.name) || base.name;
+  out.charter = str(out.charter);
+  out.government = str(out.government);
+  out.heartland = str(out.heartland);
+  out.capital = str(out.capital);
+  out.currentTurnLabel = str(out.currentTurnLabel) || "Turn 1";
+  out.currentDate = str(out.currentDate);
+  out.level = Math.max(1, Number.parseInt(String(out.level || "1"), 10) || 1);
+  out.size = Math.max(1, Number.parseInt(String(out.size || "1"), 10) || 1);
+  out.controlDC = Math.max(10, Number.parseInt(String(out.controlDC || getControlDcForLevel(getKingdomProfileById(out.profileId), out.level)), 10) || 14);
+  out.resourceDie = ["d4", "d6", "d8", "d10", "d12"].includes(str(out.resourceDie)) ? str(out.resourceDie) : "d4";
+  out.resourcePoints = Number.parseInt(String(out.resourcePoints || "0"), 10) || 0;
+  out.xp = Number.parseInt(String(out.xp || "0"), 10) || 0;
+  out.trainedSkills = Array.isArray(out.trainedSkills)
+    ? out.trainedSkills.map((skill) => str(skill)).filter(Boolean)
+    : str(out.trainedSkills)
+        .split(",")
+        .map((skill) => str(skill).trim())
+        .filter(Boolean);
+  out.abilities = {
+    culture: Number.parseInt(String(out?.abilities?.culture || "0"), 10) || 0,
+    economy: Number.parseInt(String(out?.abilities?.economy || "0"), 10) || 0,
+    loyalty: Number.parseInt(String(out?.abilities?.loyalty || "0"), 10) || 0,
+    stability: Number.parseInt(String(out?.abilities?.stability || "0"), 10) || 0
+  };
+  out.commodities = {
+    food: Number.parseInt(String(out?.commodities?.food || "0"), 10) || 0,
+    lumber: Number.parseInt(String(out?.commodities?.lumber || "0"), 10) || 0,
+    luxuries: Number.parseInt(String(out?.commodities?.luxuries || "0"), 10) || 0,
+    ore: Number.parseInt(String(out?.commodities?.ore || "0"), 10) || 0,
+    stone: Number.parseInt(String(out?.commodities?.stone || "0"), 10) || 0
+  };
+  out.consumption = Math.max(0, Number.parseInt(String(out.consumption || "0"), 10) || 0);
+  out.renown = Math.max(0, Number.parseInt(String(out.renown || "0"), 10) || 0);
+  out.fame = Math.max(0, Number.parseInt(String(out.fame || "0"), 10) || 0);
+  out.infamy = Math.max(0, Number.parseInt(String(out.infamy || "0"), 10) || 0);
+  out.unrest = Math.max(0, Number.parseInt(String(out.unrest || "0"), 10) || 0);
+  out.ruin = {
+    corruption: Math.max(0, Number.parseInt(String(out?.ruin?.corruption || "0"), 10) || 0),
+    crime: Math.max(0, Number.parseInt(String(out?.ruin?.crime || "0"), 10) || 0),
+    decay: Math.max(0, Number.parseInt(String(out?.ruin?.decay || "0"), 10) || 0),
+    strife: Math.max(0, Number.parseInt(String(out?.ruin?.strife || "0"), 10) || 0),
+    threshold: Math.max(1, Number.parseInt(String(out?.ruin?.threshold || "5"), 10) || 5)
+  };
+  out.notes = str(out.notes);
+  out.pendingProjects = Array.isArray(out.pendingProjects) ? out.pendingProjects.map((entry) => str(entry)).filter(Boolean) : [];
+  out.leaders = Array.isArray(out.leaders) ? out.leaders.map((leader) => ({ ...leader, id: str(leader?.id) || uid(), updatedAt: str(leader?.updatedAt) || "" })) : [];
+  out.settlements = Array.isArray(out.settlements)
+    ? out.settlements.map((settlement) => ({ ...settlement, id: str(settlement?.id) || uid(), updatedAt: str(settlement?.updatedAt) || "" }))
+    : [];
+  out.regions = Array.isArray(out.regions) ? out.regions.map((region) => ({ ...region, id: str(region?.id) || uid(), updatedAt: str(region?.updatedAt) || "" })) : [];
+  out.turns = Array.isArray(out.turns) ? out.turns.map((turn) => ({ ...turn, id: str(turn?.id) || uid(), updatedAt: str(turn?.updatedAt) || "" })) : [];
+  return out;
+}
+
+function getKingdomState() {
+  if (!state.kingdom || typeof state.kingdom !== "object" || Array.isArray(state.kingdom)) {
+    state.kingdom = createStarterKingdomState();
+  }
+  return state.kingdom;
+}
+
+function buildKingdomAiContext(kingdom, profile) {
+  const data = kingdom && typeof kingdom === "object" ? kingdom : getKingdomState();
+  const rulesProfile = profile || getActiveKingdomProfile();
+  return {
+    name: data.name,
+    currentTurnLabel: data.currentTurnLabel,
+    currentDate: data.currentDate,
+    level: data.level,
+    size: data.size,
+    controlDC: data.controlDC,
+    resourceDie: data.resourceDie,
+    resourcePoints: data.resourcePoints,
+    trainedSkills: [...(data.trainedSkills || [])].slice(0, 16),
+    abilities: { ...(data.abilities || {}) },
+    commodities: { ...(data.commodities || {}) },
+    consumption: data.consumption,
+    renown: data.renown,
+    fame: data.fame,
+    infamy: data.infamy,
+    unrest: data.unrest,
+    ruin: { ...(data.ruin || {}) },
+    notes: str(data.notes).slice(0, 900),
+    pendingProjects: [...(data.pendingProjects || [])].slice(0, 8),
+    leaders: (data.leaders || []).slice(0, 8),
+    settlements: (data.settlements || []).slice(0, 8),
+    regions: (data.regions || []).slice(0, 10),
+    recentTurns: (data.turns || []).slice(0, 6),
+    rulesProfile: {
+      id: rulesProfile?.id || "",
+      label: rulesProfile?.label || "",
+      summary: str(rulesProfile?.summary || "").slice(0, 420),
+      turnStructure: (rulesProfile?.turnStructure || []).map((entry) => `${entry.phase}: ${entry.summary}`).slice(0, 5),
+      aiSummary: [...(rulesProfile?.aiContextSummary || [])].slice(0, 8)
+    }
+  };
+}
+
+function applyKingdomOverviewForm(fields) {
+  const kingdom = getKingdomState();
+  const profileId = str(fields.profileId) || kingdom.profileId || getDefaultKingdomProfileId();
+  const profile = getKingdomProfileById(profileId);
+  kingdom.profileId = profile?.id || getDefaultKingdomProfileId();
+  kingdom.name = str(fields.name);
+  kingdom.charter = str(fields.charter);
+  kingdom.government = str(fields.government);
+  kingdom.heartland = str(fields.heartland);
+  kingdom.capital = str(fields.capital);
+  kingdom.currentTurnLabel = str(fields.currentTurnLabel) || kingdom.currentTurnLabel;
+  kingdom.currentDate = str(fields.currentDate);
+  kingdom.level = Math.max(1, Number.parseInt(String(fields.level || kingdom.level || "1"), 10) || 1);
+  kingdom.size = Math.max(1, Number.parseInt(String(fields.size || kingdom.size || "1"), 10) || 1);
+  kingdom.controlDC = Math.max(
+    10,
+    Number.parseInt(String(fields.controlDC || getControlDcForLevel(profile, kingdom.level)), 10) || getControlDcForLevel(profile, kingdom.level)
+  );
+  kingdom.resourceDie = ["d4", "d6", "d8", "d10", "d12"].includes(str(fields.resourceDie)) ? str(fields.resourceDie) : kingdom.resourceDie;
+  kingdom.resourcePoints = Number.parseInt(String(fields.resourcePoints || kingdom.resourcePoints || "0"), 10) || 0;
+  kingdom.xp = Number.parseInt(String(fields.xp || kingdom.xp || "0"), 10) || 0;
+  kingdom.trainedSkills = str(fields.trainedSkills)
+    .split(",")
+    .map((skill) => str(skill).trim())
+    .filter(Boolean);
+  kingdom.abilities = {
+    culture: Number.parseInt(String(fields.culture || kingdom.abilities.culture || "0"), 10) || 0,
+    economy: Number.parseInt(String(fields.economy || kingdom.abilities.economy || "0"), 10) || 0,
+    loyalty: Number.parseInt(String(fields.loyalty || kingdom.abilities.loyalty || "0"), 10) || 0,
+    stability: Number.parseInt(String(fields.stability || kingdom.abilities.stability || "0"), 10) || 0
+  };
+  kingdom.commodities = {
+    food: Number.parseInt(String(fields.food || kingdom.commodities.food || "0"), 10) || 0,
+    lumber: Number.parseInt(String(fields.lumber || kingdom.commodities.lumber || "0"), 10) || 0,
+    luxuries: Number.parseInt(String(fields.luxuries || kingdom.commodities.luxuries || "0"), 10) || 0,
+    ore: Number.parseInt(String(fields.ore || kingdom.commodities.ore || "0"), 10) || 0,
+    stone: Number.parseInt(String(fields.stone || kingdom.commodities.stone || "0"), 10) || 0
+  };
+  kingdom.consumption = Math.max(0, Number.parseInt(String(fields.consumption || kingdom.consumption || "0"), 10) || 0);
+  kingdom.renown = Math.max(0, Number.parseInt(String(fields.renown || kingdom.renown || "0"), 10) || 0);
+  kingdom.fame = Math.max(0, Number.parseInt(String(fields.fame || kingdom.fame || "0"), 10) || 0);
+  kingdom.infamy = Math.max(0, Number.parseInt(String(fields.infamy || kingdom.infamy || "0"), 10) || 0);
+  kingdom.unrest = Math.max(0, Number.parseInt(String(fields.unrest || kingdom.unrest || "0"), 10) || 0);
+  kingdom.ruin = {
+    corruption: Math.max(0, Number.parseInt(String(fields.corruption || kingdom.ruin.corruption || "0"), 10) || 0),
+    crime: Math.max(0, Number.parseInt(String(fields.crime || kingdom.ruin.crime || "0"), 10) || 0),
+    decay: Math.max(0, Number.parseInt(String(fields.decay || kingdom.ruin.decay || "0"), 10) || 0),
+    strife: Math.max(0, Number.parseInt(String(fields.strife || kingdom.ruin.strife || "0"), 10) || 0),
+    threshold: Math.max(1, Number.parseInt(String(fields.ruinThreshold || kingdom.ruin.threshold || "5"), 10) || 5)
+  };
+  kingdom.notes = str(fields.notes);
+}
+
+function createKingdomLeader(fields) {
+  const kingdom = getKingdomState();
+  kingdom.leaders.unshift({
+    id: uid(),
+    role: str(fields.role) || "Leader",
+    name: str(fields.name) || "Unnamed leader",
+    type: str(fields.type) || "NPC",
+    leadershipBonus: Number.parseInt(String(fields.leadershipBonus || "0"), 10) || 0,
+    relevantSkills: str(fields.relevantSkills),
+    specializedSkills: str(fields.specializedSkills),
+    notes: str(fields.notes),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function createKingdomSettlement(fields) {
+  const kingdom = getKingdomState();
+  kingdom.settlements.unshift({
+    id: uid(),
+    name: str(fields.name) || "Unnamed settlement",
+    size: str(fields.size) || "Village",
+    influence: Math.max(0, Number.parseInt(String(fields.influence || "0"), 10) || 0),
+    civicStructure: str(fields.civicStructure),
+    resourceDice: Math.max(0, Number.parseInt(String(fields.resourceDice || "0"), 10) || 0),
+    consumption: Math.max(0, Number.parseInt(String(fields.consumption || "0"), 10) || 0),
+    notes: str(fields.notes),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function createKingdomRegion(fields) {
+  const kingdom = getKingdomState();
+  kingdom.regions.unshift({
+    id: uid(),
+    hex: str(fields.hex) || "Unknown hex",
+    status: str(fields.status) || "Claimed",
+    terrain: str(fields.terrain),
+    workSite: str(fields.workSite),
+    notes: str(fields.notes),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function applyKingdomTurnForm(fields) {
+  const kingdom = getKingdomState();
+  const title = str(fields.title) || `Turn ${kingdom.turns.length + 1}`;
+  const rpDelta = Number.parseInt(String(fields.rpDelta || "0"), 10) || 0;
+  const unrestDelta = Number.parseInt(String(fields.unrestDelta || "0"), 10) || 0;
+  const renownDelta = Number.parseInt(String(fields.renownDelta || "0"), 10) || 0;
+  const fameDelta = Number.parseInt(String(fields.fameDelta || "0"), 10) || 0;
+  const infamyDelta = Number.parseInt(String(fields.infamyDelta || "0"), 10) || 0;
+  const corruptionDelta = Number.parseInt(String(fields.corruptionDelta || "0"), 10) || 0;
+  const crimeDelta = Number.parseInt(String(fields.crimeDelta || "0"), 10) || 0;
+  const decayDelta = Number.parseInt(String(fields.decayDelta || "0"), 10) || 0;
+  const strifeDelta = Number.parseInt(String(fields.strifeDelta || "0"), 10) || 0;
+  const foodDelta = Number.parseInt(String(fields.foodDelta || "0"), 10) || 0;
+  const lumberDelta = Number.parseInt(String(fields.lumberDelta || "0"), 10) || 0;
+  const luxuriesDelta = Number.parseInt(String(fields.luxuriesDelta || "0"), 10) || 0;
+  const oreDelta = Number.parseInt(String(fields.oreDelta || "0"), 10) || 0;
+  const stoneDelta = Number.parseInt(String(fields.stoneDelta || "0"), 10) || 0;
+  kingdom.currentTurnLabel = title;
+  kingdom.currentDate = str(fields.date) || kingdom.currentDate;
+  kingdom.resourcePoints += rpDelta;
+  kingdom.unrest = Math.max(0, kingdom.unrest + unrestDelta);
+  kingdom.renown = Math.max(0, kingdom.renown + renownDelta);
+  kingdom.fame = Math.max(0, kingdom.fame + fameDelta);
+  kingdom.infamy = Math.max(0, kingdom.infamy + infamyDelta);
+  kingdom.ruin.corruption = Math.max(0, kingdom.ruin.corruption + corruptionDelta);
+  kingdom.ruin.crime = Math.max(0, kingdom.ruin.crime + crimeDelta);
+  kingdom.ruin.decay = Math.max(0, kingdom.ruin.decay + decayDelta);
+  kingdom.ruin.strife = Math.max(0, kingdom.ruin.strife + strifeDelta);
+  kingdom.commodities.food += foodDelta;
+  kingdom.commodities.lumber += lumberDelta;
+  kingdom.commodities.luxuries += luxuriesDelta;
+  kingdom.commodities.ore += oreDelta;
+  kingdom.commodities.stone += stoneDelta;
+  kingdom.turns.unshift({
+    id: uid(),
+    title,
+    date: str(fields.date),
+    rpDelta,
+    unrestDelta,
+    renownDelta,
+    fameDelta,
+    infamyDelta,
+    summary: str(fields.summary),
+    risks: str(fields.risks),
+    updatedAt: new Date().toISOString()
+  });
+  const latest = getLatestSession();
+  if (latest) {
+    latest.kingdomTurn = title;
+    latest.updatedAt = new Date().toISOString();
+  }
+  const pending = str(fields.pendingProject);
+  if (pending) {
+    kingdom.pendingProjects.unshift(pending);
+    kingdom.pendingProjects = [...new Set(kingdom.pendingProjects.map((entry) => str(entry)).filter(Boolean))].slice(0, 16);
+  }
+}
+
+function appendKingdomAiNote(text) {
+  const kingdom = getKingdomState();
+  const stamp = new Date().toLocaleString();
+  const block = `[AI ${stamp}]\n${str(text)}`;
+  kingdom.notes = kingdom.notes ? `${kingdom.notes}\n\n${block}`.trim() : block;
+  saveState();
+}
+
+function renderKingdom() {
+  const kingdom = getKingdomState();
+  const profile = getActiveKingdomProfile();
+  const sourceLines = Array.isArray(profile?.sources)
+    ? profile.sources
+        .map((source) => `${source.title}${source.role ? ` (${source.role})` : ""}`)
+        .filter(Boolean)
+    : [];
+  return `
+    <div class="page-stack kingdom-page">
+      ${renderPageIntro(
+        "Kingdom",
+        "Track the kingdom sheet, leaders, settlements, regions, turn flow, and the active kingdom-rules profile in one place."
+      )}
+      <section class="panel flow-panel">
+        <div class="entry-head">
+          <div>
+            <h2 style="margin:0;">Rules Profile</h2>
+            <p class="small" style="margin:6px 0 0;">${escapeHtml(profile?.summary || "No kingdom rules profile loaded.")}</p>
+          </div>
+          <div class="kingdom-profile-pill">${escapeHtml(profile?.shortLabel || profile?.label || "Unknown profile")}</div>
+        </div>
+        ${ui.kingdomMessage ? `<p class="small">${escapeHtml(ui.kingdomMessage)}</p>` : ""}
+        <div class="kingdom-chip-row">
+          <span class="chip">Version ${escapeHtml(str(profile?.version || "unknown"))}</span>
+          <span class="chip">Turn ${escapeHtml(kingdom.currentTurnLabel || "Turn 1")}</span>
+          <span class="chip">Control DC ${escapeHtml(String(kingdom.controlDC || 14))}</span>
+          <span class="chip">Resource Die ${escapeHtml(kingdom.resourceDie || "d4")}</span>
+          <span class="chip">Settlements ${escapeHtml(String(kingdom.settlements.length))}</span>
+          <span class="chip">Regions ${escapeHtml(String(kingdom.regions.length))}</span>
+        </div>
+        ${
+          sourceLines.length
+            ? `
+              <details class="kingdom-guide-panel">
+                <summary>Profile Sources</summary>
+                <ul class="flow-list">
+                  ${sourceLines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}
+                </ul>
+              </details>
+            `
+            : ""
+        }
+      </section>
+
+      <section class="panel step-card">
+        <div class="step-head">
+          <span class="step-badge">1</span>
+          <h2>Kingdom Sheet</h2>
+        </div>
+        <form data-form="kingdom-overview">
+          <div class="row">
+            <label>Rules Profile
+              <select name="profileId">
+                ${getKingdomRulesProfiles()
+                  .map(
+                    (entry) =>
+                      `<option value="${escapeHtml(entry.id)}" ${entry.id === kingdom.profileId ? "selected" : ""}>${escapeHtml(entry.label)}</option>`
+                  )
+                  .join("")}
+              </select>
+            </label>
+            <label>Kingdom Name
+              <input name="name" value="${escapeHtml(kingdom.name || "")}" placeholder="Stolen Lands Charter" />
+            </label>
+            <label>Capital
+              <input name="capital" value="${escapeHtml(kingdom.capital || "")}" placeholder="Tuskfall" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Charter
+              <input name="charter" value="${escapeHtml(kingdom.charter || "")}" placeholder="Open charter" />
+            </label>
+            <label>Government
+              <input name="government" value="${escapeHtml(kingdom.government || "")}" placeholder="Council" />
+            </label>
+            <label>Heartland
+              <input name="heartland" value="${escapeHtml(kingdom.heartland || "")}" placeholder="Grassland" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Current Turn Label
+              <input name="currentTurnLabel" value="${escapeHtml(kingdom.currentTurnLabel || "")}" placeholder="Turn 3" />
+            </label>
+            <label>Current Date
+              <input name="currentDate" value="${escapeHtml(kingdom.currentDate || "")}" placeholder="4712-09-01" />
+            </label>
+            <label>Level
+              <input name="level" type="number" min="1" max="20" value="${escapeHtml(String(kingdom.level || 1))}" />
+            </label>
+            <label>Size
+              <input name="size" type="number" min="1" value="${escapeHtml(String(kingdom.size || 1))}" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Control DC
+              <input name="controlDC" type="number" min="10" value="${escapeHtml(String(kingdom.controlDC || 14))}" />
+            </label>
+            <label>Resource Die
+              <select name="resourceDie">
+                ${["d4", "d6", "d8", "d10", "d12"]
+                  .map((die) => `<option value="${die}" ${kingdom.resourceDie === die ? "selected" : ""}>${die}</option>`)
+                  .join("")}
+              </select>
+            </label>
+            <label>Resource Points
+              <input name="resourcePoints" type="number" value="${escapeHtml(String(kingdom.resourcePoints || 0))}" />
+            </label>
+            <label>XP
+              <input name="xp" type="number" value="${escapeHtml(String(kingdom.xp || 0))}" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Culture
+              <input name="culture" type="number" value="${escapeHtml(String(kingdom.abilities.culture || 0))}" />
+            </label>
+            <label>Economy
+              <input name="economy" type="number" value="${escapeHtml(String(kingdom.abilities.economy || 0))}" />
+            </label>
+            <label>Loyalty
+              <input name="loyalty" type="number" value="${escapeHtml(String(kingdom.abilities.loyalty || 0))}" />
+            </label>
+            <label>Stability
+              <input name="stability" type="number" value="${escapeHtml(String(kingdom.abilities.stability || 0))}" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Food
+              <input name="food" type="number" value="${escapeHtml(String(kingdom.commodities.food || 0))}" />
+            </label>
+            <label>Lumber
+              <input name="lumber" type="number" value="${escapeHtml(String(kingdom.commodities.lumber || 0))}" />
+            </label>
+            <label>Luxuries
+              <input name="luxuries" type="number" value="${escapeHtml(String(kingdom.commodities.luxuries || 0))}" />
+            </label>
+            <label>Ore
+              <input name="ore" type="number" value="${escapeHtml(String(kingdom.commodities.ore || 0))}" />
+            </label>
+            <label>Stone
+              <input name="stone" type="number" value="${escapeHtml(String(kingdom.commodities.stone || 0))}" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Consumption
+              <input name="consumption" type="number" min="0" value="${escapeHtml(String(kingdom.consumption || 0))}" />
+            </label>
+            <label>Renown
+              <input name="renown" type="number" min="0" value="${escapeHtml(String(kingdom.renown || 0))}" />
+            </label>
+            <label>Fame
+              <input name="fame" type="number" min="0" value="${escapeHtml(String(kingdom.fame || 0))}" />
+            </label>
+            <label>Infamy
+              <input name="infamy" type="number" min="0" value="${escapeHtml(String(kingdom.infamy || 0))}" />
+            </label>
+            <label>Unrest
+              <input name="unrest" type="number" min="0" value="${escapeHtml(String(kingdom.unrest || 0))}" />
+            </label>
+          </div>
+          <div class="row">
+            <label>Corruption
+              <input name="corruption" type="number" min="0" value="${escapeHtml(String(kingdom.ruin.corruption || 0))}" />
+            </label>
+            <label>Crime
+              <input name="crime" type="number" min="0" value="${escapeHtml(String(kingdom.ruin.crime || 0))}" />
+            </label>
+            <label>Decay
+              <input name="decay" type="number" min="0" value="${escapeHtml(String(kingdom.ruin.decay || 0))}" />
+            </label>
+            <label>Strife
+              <input name="strife" type="number" min="0" value="${escapeHtml(String(kingdom.ruin.strife || 0))}" />
+            </label>
+            <label>Ruin Threshold
+              <input name="ruinThreshold" type="number" min="1" value="${escapeHtml(String(kingdom.ruin.threshold || 5))}" />
+            </label>
+          </div>
+          <label>Trained Skills (comma separated)
+            <input name="trainedSkills" value="${escapeHtml((kingdom.trainedSkills || []).join(", "))}" placeholder="Agriculture, Politics, Trade, Wilderness" />
+          </label>
+          <label>Kingdom Notes
+            <textarea name="notes" placeholder="Track active plans, open rulings, and the state of the kingdom here.">${escapeHtml(kingdom.notes || "")}</textarea>
+          </label>
+          <div class="toolbar">
+            <button class="btn btn-primary" type="submit">Save Kingdom Sheet</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="kingdom-overview-grid">
+        <article class="panel">
+          <h2>Leaders</h2>
+          <form data-form="kingdom-leader">
+            <div class="row">
+              <label>Role
+                <select name="role">
+                  ${["Ruler", "Counselor", "Emissary", "General", "Magister", "Treasurer", "Viceroy", "Warden"]
+                    .map((role) => `<option value="${role}">${role}</option>`)
+                    .join("")}
+                </select>
+              </label>
+              <label>Name
+                <input name="name" placeholder="Amiri" />
+              </label>
+              <label>Type
+                <select name="type">
+                  <option value="PC">PC</option>
+                  <option value="NPC">NPC</option>
+                </select>
+              </label>
+              <label>Leadership Bonus
+                <input name="leadershipBonus" type="number" min="0" max="4" value="1" />
+              </label>
+            </div>
+            <label>Relevant Skills
+              <input name="relevantSkills" placeholder="Diplomacy, Politics Lore" />
+            </label>
+            <label>Specialized Kingdom Skills
+              <input name="specializedSkills" placeholder="Politics, Statecraft, Trade" />
+            </label>
+            <label>Notes
+              <textarea name="notes" placeholder="Why this leader is good in this role, house rulings, companion details..."></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Add Leader</button>
+            </div>
+          </form>
+          <div class="card-list">
+            ${kingdom.leaders.length ? kingdom.leaders.map((leader) => renderKingdomLeaderEntry(leader)).join("") : `<p class="empty">No leaders tracked yet.</p>`}
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>Settlements</h2>
+          <form data-form="kingdom-settlement">
+            <div class="row">
+              <label>Name
+                <input name="name" placeholder="Tuskfall" />
+              </label>
+              <label>Size
+                <select name="size">
+                  ${["Village", "Town", "City", "Metropolis"].map((size) => `<option value="${size}">${size}</option>`).join("")}
+                </select>
+              </label>
+              <label>Influence
+                <input name="influence" type="number" min="0" value="1" />
+              </label>
+            </div>
+            <div class="row">
+              <label>Civic Structure
+                <select name="civicStructure">
+                  ${["", "Town Hall", "Castle", "Palace"].map((value) => `<option value="${value}">${value || "None"}</option>`).join("")}
+                </select>
+              </label>
+              <label>Resource Dice
+                <input name="resourceDice" type="number" min="0" value="0" />
+              </label>
+              <label>Consumption
+                <input name="consumption" type="number" min="0" value="0" />
+              </label>
+            </div>
+            <label>Notes
+              <textarea name="notes" placeholder="Infrastructure, civic limits, item bonuses, special buildings..."></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Add Settlement</button>
+            </div>
+          </form>
+          <div class="card-list">
+            ${kingdom.settlements.length
+              ? kingdom.settlements.map((settlement) => renderKingdomSettlementEntry(settlement)).join("")
+              : `<p class="empty">No settlements tracked yet.</p>`}
+          </div>
+        </article>
+      </section>
+
+      <section class="kingdom-overview-grid">
+        <article class="panel">
+          <h2>Regions / Hexes</h2>
+          <form data-form="kingdom-region">
+            <div class="row">
+              <label>Hex
+                <input name="hex" placeholder="B3" />
+              </label>
+              <label>Status
+                <select name="status">
+                  ${["Claimed", "Reconnoitered", "Work Site", "Settlement", "Contested"].map((status) => `<option value="${status}">${status}</option>`).join("")}
+                </select>
+              </label>
+              <label>Terrain
+                <input name="terrain" placeholder="Forest" />
+              </label>
+              <label>Work Site
+                <input name="workSite" placeholder="Lumber Camp" />
+              </label>
+            </div>
+            <label>Notes
+              <textarea name="notes" placeholder="Terrain features, refuge, danger, or why this hex matters."></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Add Region Record</button>
+            </div>
+          </form>
+          <div class="card-list">
+            ${kingdom.regions.length ? kingdom.regions.map((region) => renderKingdomRegionEntry(region)).join("") : `<p class="empty">No regions tracked yet.</p>`}
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>Run Kingdom Turn</h2>
+          <p class="small">Use the active rules profile to resolve the turn, then record the deltas here so the kingdom sheet stays current.</p>
+          <form data-form="kingdom-turn">
+            <div class="row">
+              <label>Turn Title
+                <input name="title" placeholder="Turn 4 - Harvest Preparations" />
+              </label>
+              <label>Date
+                <input name="date" placeholder="4712-11-01" />
+              </label>
+              <label>Pending Project
+                <input name="pendingProject" placeholder="Finish Town Hall foundation" />
+              </label>
+            </div>
+            <div class="row">
+              <label>RP Delta
+                <input name="rpDelta" type="number" value="0" />
+              </label>
+              <label>Unrest Delta
+                <input name="unrestDelta" type="number" value="0" />
+              </label>
+              <label>Renown Delta
+                <input name="renownDelta" type="number" value="0" />
+              </label>
+              <label>Fame Delta
+                <input name="fameDelta" type="number" value="0" />
+              </label>
+              <label>Infamy Delta
+                <input name="infamyDelta" type="number" value="0" />
+              </label>
+            </div>
+            <div class="row">
+              <label>Food Delta
+                <input name="foodDelta" type="number" value="0" />
+              </label>
+              <label>Lumber Delta
+                <input name="lumberDelta" type="number" value="0" />
+              </label>
+              <label>Luxuries Delta
+                <input name="luxuriesDelta" type="number" value="0" />
+              </label>
+              <label>Ore Delta
+                <input name="oreDelta" type="number" value="0" />
+              </label>
+              <label>Stone Delta
+                <input name="stoneDelta" type="number" value="0" />
+              </label>
+            </div>
+            <div class="row">
+              <label>Corruption Delta
+                <input name="corruptionDelta" type="number" value="0" />
+              </label>
+              <label>Crime Delta
+                <input name="crimeDelta" type="number" value="0" />
+              </label>
+              <label>Decay Delta
+                <input name="decayDelta" type="number" value="0" />
+              </label>
+              <label>Strife Delta
+                <input name="strifeDelta" type="number" value="0" />
+              </label>
+            </div>
+            <label>Turn Summary
+              <textarea name="summary" placeholder="What happened in Upkeep, Activities, Construction, and Event?"></textarea>
+            </label>
+            <label>Risks / Follow-Ups
+              <textarea name="risks" placeholder="What needs attention next turn?"></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Apply Kingdom Turn</button>
+            </div>
+          </form>
+          <div class="card-list">
+            ${kingdom.turns.length ? kingdom.turns.map((turn) => renderKingdomTurnEntry(turn)).join("") : `<p class="empty">No kingdom turns recorded yet.</p>`}
+          </div>
+        </article>
+      </section>
+
+      <section class="panel kingdom-guide-panel">
+        <h2>Kingdom Guide</h2>
+        <p class="small">This guide is built from the active rules profile so Loremaster and the kingdom sheet stay aligned.</p>
+        ${renderKingdomGuide(profile, kingdom)}
+      </section>
+    </div>
+  `;
+}
+
+function renderKingdomGuide(profile, kingdom) {
+  const pcLeaders = (kingdom?.leaders || []).filter((leader) => str(leader?.type).toUpperCase() === "PC").length;
+  const npcLeaders = Math.max(0, (kingdom?.leaders || []).length - pcLeaders);
+  const sections = [
+    renderKingdomGuideSection("Rules Stack", `
+      <p class="small">${escapeHtml(profile?.summary || "No kingdom rules profile loaded.")}</p>
+      ${renderKingdomGuideList(
+        (profile?.sources || []).map((source) => `${source.title}${source.role ? ` (${source.role})` : ""}`),
+        { className: "kingdom-source-list" }
+      )}
+    `),
+    renderKingdomGuideSection("Quick Start", renderKingdomGuideList(profile?.quickStart || [], { ordered: true })),
+    renderKingdomGuideSection(
+      "Turn Structure",
+      `
+        <div class="kingdom-chip-row">
+          <span class="chip">Current Turn ${escapeHtml(kingdom?.currentTurnLabel || "Turn 1")}</span>
+          <span class="chip">PC Leader Actions ${escapeHtml(String(pcLeaders * 3))}</span>
+          <span class="chip">NPC Leader Actions ${escapeHtml(String(npcLeaders * 2))}</span>
+          <span class="chip">Pending Projects ${escapeHtml(String((kingdom?.pendingProjects || []).length))}</span>
+        </div>
+        <div class="card-list kingdom-guide-cards">
+          ${(profile?.turnStructure || [])
+            .map(
+              (entry) => `
+                <article class="entry">
+                  <div class="entry-head">
+                    <span class="entry-title">${escapeHtml(entry?.phase || "Phase")}</span>
+                  </div>
+                  <p>${escapeHtml(entry?.summary || "")}</p>
+                </article>
+              `
+            )
+            .join("")}
+        </div>
+      `
+    ),
+    renderKingdomGuideSection(
+      "Action Economy",
+      `
+        <p class="small">The remastered profile collapses turn actions into an activity economy: each PC leader gets 3 actions, each NPC leader gets 2, and civic structures can add settlement actions.</p>
+        ${renderKingdomGuideList(profile?.actionLimits || [])}
+      `
+    ),
+    renderKingdomGuideSection("Kingdom Creation", renderKingdomGuideList(profile?.creationChanges || [])),
+    renderKingdomGuideSection("Math And Scaling", renderKingdomGuideList(profile?.mathAdjustments || [])),
+    renderKingdomGuideSection("Leadership Rules", renderKingdomGuideList(profile?.leadershipRules || [])),
+    renderKingdomGuideSection(
+      "Leadership Roles",
+      `
+        <div class="card-list kingdom-guide-cards">
+          ${(profile?.leadershipRoles || [])
+            .map(
+              (role) => `
+                <article class="entry">
+                  <div class="entry-head">
+                    <span class="entry-title">${escapeHtml(role?.role || "Role")}</span>
+                  </div>
+                  <p><strong>Relevant Skills:</strong> ${escapeHtml((role?.relevantSkills || []).join(", ") || "None listed.")}</p>
+                  <p><strong>Specialized Kingdom Skills:</strong> ${escapeHtml((role?.specializedSkills || []).join(", ") || "None listed.")}</p>
+                </article>
+              `
+            )
+            .join("")}
+        </div>
+      `
+    ),
+    renderKingdomGuideSection("Economy And XP", renderKingdomGuideList(profile?.economyAndXP || [])),
+    renderKingdomGuideSection(
+      "Activities",
+      `
+        ${renderKingdomGuideList(
+          (profile?.activitiesAdded || []).map(
+            (entry) => `${entry.name}${entry.source ? ` (${entry.source})` : ""}: ${entry.summary || ""}`
+          )
+        )}
+        ${renderKingdomGuideList(profile?.activitiesChanged || [])}
+      `
+    ),
+    renderKingdomGuideSection("Settlements", renderKingdomGuideList(profile?.settlementRules || [])),
+    renderKingdomGuideSection("Construction", renderKingdomGuideList(profile?.constructionRules || [])),
+    renderKingdomGuideSection("Structure Bonus Notes", renderKingdomGuideList(profile?.structureBonuses || [])),
+    renderKingdomGuideSection("Clarifications", renderKingdomGuideList(profile?.clarifications || [])),
+    renderKingdomGuideSection(
+      "Advancement Table",
+      `
+        <div class="card-list kingdom-advancement-grid">
+          ${(profile?.advancement || [])
+            .map(
+              (entry) => `
+                <article class="entry">
+                  <div class="entry-head">
+                    <span class="entry-title">Level ${escapeHtml(String(entry?.level || "?"))}</span>
+                    <span class="entry-meta">Control DC ${escapeHtml(String(entry?.controlDC || "?"))}</span>
+                  </div>
+                  ${renderKingdomGuideList(entry?.features || [])}
+                </article>
+              `
+            )
+            .join("")}
+        </div>
+      `
+    ),
+    renderKingdomGuideSection("Current Watchlist", renderKingdomGuideList(kingdom?.pendingProjects || [])),
+    renderKingdomGuideSection("AI Prompt Ideas", renderKingdomGuideList(profile?.helpPrompts || [])),
+  ];
+  return `<div class="kingdom-guide-grid">${sections.filter(Boolean).join("")}</div>`;
+}
+
+function renderKingdomGuideSection(title, body) {
+  const cleanBody = str(body);
+  if (!cleanBody) return "";
+  return `
+    <details class="session-edit-panel kingdom-guide-section" open>
+      <summary>${escapeHtml(title)}</summary>
+      <div class="kingdom-guide-body">${body}</div>
+    </details>
+  `;
+}
+
+function renderKingdomGuideList(items, options = {}) {
+  const entries = Array.isArray(items) ? items.map((entry) => str(entry)).filter(Boolean) : [];
+  if (!entries.length) return "";
+  const tag = options.ordered ? "ol" : "ul";
+  const className = options.className || "flow-list";
+  return `<${tag} class="${className}">${entries.map((entry) => `<li>${escapeHtml(entry)}</li>`).join("")}</${tag}>`;
+}
+
+function renderKingdomLeaderEntry(leader) {
+  return `
+    <article class="entry">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(leader.name || "Unnamed leader")}</span>
+        <span class="entry-meta">${escapeHtml(leader.role || "Role")} • ${escapeHtml(leader.type || "NPC")} • +${escapeHtml(String(leader.leadershipBonus || 0))}</span>
+      </div>
+      <div class="row">
+        <label>Role
+          <input data-collection="kingdomLeaders" data-id="${leader.id}" data-field="role" value="${escapeHtml(leader.role || "")}" />
+        </label>
+        <label>Name
+          <input data-collection="kingdomLeaders" data-id="${leader.id}" data-field="name" value="${escapeHtml(leader.name || "")}" />
+        </label>
+        <label>Type
+          <select data-collection="kingdomLeaders" data-id="${leader.id}" data-field="type">
+            ${["PC", "NPC"].map((value) => `<option value="${value}" ${leader.type === value ? "selected" : ""}>${value}</option>`).join("")}
+          </select>
+        </label>
+        <label>Leadership Bonus
+          <input data-collection="kingdomLeaders" data-id="${leader.id}" data-field="leadershipBonus" type="number" min="0" max="4" value="${escapeHtml(
+            String(leader.leadershipBonus || 0)
+          )}" />
+        </label>
+      </div>
+      <label>Relevant Skills
+        <input data-collection="kingdomLeaders" data-id="${leader.id}" data-field="relevantSkills" value="${escapeHtml(leader.relevantSkills || "")}" />
+      </label>
+      <label>Specialized Skills
+        <input data-collection="kingdomLeaders" data-id="${leader.id}" data-field="specializedSkills" value="${escapeHtml(leader.specializedSkills || "")}" />
+      </label>
+      <label>Notes
+        <textarea data-collection="kingdomLeaders" data-id="${leader.id}" data-field="notes">${escapeHtml(leader.notes || "")}</textarea>
+      </label>
+      <div class="toolbar">
+        <button class="btn btn-danger" data-action="delete" data-collection="kingdomLeaders" data-id="${leader.id}">Delete Leader</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderKingdomSettlementEntry(settlement) {
+  return `
+    <article class="entry">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(settlement.name || "Unnamed settlement")}</span>
+        <span class="entry-meta">${escapeHtml(settlement.size || "Settlement")} • influence ${escapeHtml(String(settlement.influence || 0))}</span>
+      </div>
+      <div class="row">
+        <label>Name
+          <input data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="name" value="${escapeHtml(settlement.name || "")}" />
+        </label>
+        <label>Size
+          <select data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="size">
+            ${["Village", "Town", "City", "Metropolis"]
+              .map((value) => `<option value="${value}" ${settlement.size === value ? "selected" : ""}>${value}</option>`)
+              .join("")}
+          </select>
+        </label>
+        <label>Influence
+          <input data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="influence" type="number" min="0" value="${escapeHtml(
+            String(settlement.influence || 0)
+          )}" />
+        </label>
+      </div>
+      <div class="row">
+        <label>Civic Structure
+          <select data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="civicStructure">
+            ${["", "Town Hall", "Castle", "Palace"]
+              .map((value) => `<option value="${value}" ${settlement.civicStructure === value ? "selected" : ""}>${value || "None"}</option>`)
+              .join("")}
+          </select>
+        </label>
+        <label>Resource Dice
+          <input data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="resourceDice" type="number" min="0" value="${escapeHtml(
+            String(settlement.resourceDice || 0)
+          )}" />
+        </label>
+        <label>Consumption
+          <input data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="consumption" type="number" min="0" value="${escapeHtml(
+            String(settlement.consumption || 0)
+          )}" />
+        </label>
+      </div>
+      <label>Notes
+        <textarea data-collection="kingdomSettlements" data-id="${settlement.id}" data-field="notes">${escapeHtml(settlement.notes || "")}</textarea>
+      </label>
+      <div class="toolbar">
+        <button class="btn btn-danger" data-action="delete" data-collection="kingdomSettlements" data-id="${settlement.id}">Delete Settlement</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderKingdomRegionEntry(region) {
+  return `
+    <article class="entry">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(region.hex || "Unknown hex")}</span>
+        <span class="entry-meta">${escapeHtml(region.status || "Status unknown")} • ${escapeHtml(region.terrain || "terrain n/a")}</span>
+      </div>
+      <div class="row">
+        <label>Hex
+          <input data-collection="kingdomRegions" data-id="${region.id}" data-field="hex" value="${escapeHtml(region.hex || "")}" />
+        </label>
+        <label>Status
+          <input data-collection="kingdomRegions" data-id="${region.id}" data-field="status" value="${escapeHtml(region.status || "")}" />
+        </label>
+        <label>Terrain
+          <input data-collection="kingdomRegions" data-id="${region.id}" data-field="terrain" value="${escapeHtml(region.terrain || "")}" />
+        </label>
+        <label>Work Site
+          <input data-collection="kingdomRegions" data-id="${region.id}" data-field="workSite" value="${escapeHtml(region.workSite || "")}" />
+        </label>
+      </div>
+      <label>Notes
+        <textarea data-collection="kingdomRegions" data-id="${region.id}" data-field="notes">${escapeHtml(region.notes || "")}</textarea>
+      </label>
+      <div class="toolbar">
+        <button class="btn btn-danger" data-action="delete" data-collection="kingdomRegions" data-id="${region.id}">Delete Region</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderKingdomTurnEntry(turn) {
+  return `
+    <article class="entry">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(turn.title || "Kingdom Turn")}</span>
+        <span class="entry-meta">${escapeHtml(turn.date || "No date")} • RP ${turn.rpDelta >= 0 ? "+" : ""}${escapeHtml(String(turn.rpDelta || 0))} • Unrest ${
+          turn.unrestDelta >= 0 ? "+" : ""
+        }${escapeHtml(String(turn.unrestDelta || 0))}</span>
+      </div>
+      <label>Title
+        <input data-collection="kingdomTurns" data-id="${turn.id}" data-field="title" value="${escapeHtml(turn.title || "")}" />
+      </label>
+      <div class="row">
+        <label>Date
+          <input data-collection="kingdomTurns" data-id="${turn.id}" data-field="date" value="${escapeHtml(turn.date || "")}" />
+        </label>
+        <label>Summary
+          <input data-collection="kingdomTurns" data-id="${turn.id}" data-field="summary" value="${escapeHtml(turn.summary || "")}" />
+        </label>
+      </div>
+      <label>Risks / Follow-Ups
+        <textarea data-collection="kingdomTurns" data-id="${turn.id}" data-field="risks">${escapeHtml(turn.risks || "")}</textarea>
+      </label>
+      <div class="toolbar">
+        <button class="btn btn-danger" data-action="delete" data-collection="kingdomTurns" data-id="${turn.id}">Delete Turn</button>
+      </div>
+    </article>
+  `;
+}
+
 function renderPdfIntel() {
   const indexedFiles = Array.isArray(state?.meta?.pdfIndexedFiles)
     ? state.meta.pdfIndexedFiles.map((name) => str(name)).filter(Boolean)
@@ -2136,7 +3386,7 @@ function renderPdfIntel() {
           <span class="step-badge">3</span>
           <h2>Use Search Results</h2>
         </div>
-        <p class="small">Open the exact matched page first, then use the snippet to quickly verify context.</p>
+        <p class="small">Open the exact matched page first, then use the snippet to quickly verify context. Hybrid matches combine keyword and semantic retrieval when a local embedding model is available.</p>
         <div class="card-list" style="margin-top:12px;">
           ${
             ui.pdfSearchResults.length
@@ -2146,9 +3396,9 @@ function renderPdfIntel() {
                     <article class="entry">
                       <div class="entry-head">
                         <span class="entry-title">${escapeHtml(r.fileName)}</span>
-                        <span class="entry-meta">Page ${escapeHtml(String(r.page || 1))} | Score: ${escapeHtml(
-                          String(r.score)
-                        )}</span>
+                        <span class="entry-meta">Page ${escapeHtml(String(r.page || 1))} | ${escapeHtml(
+                          sentenceCaseAndPunctuation(String(r.searchMode || "lexical")).replace(/\.$/, "")
+                        )} | Score: ${escapeHtml(String(r.score))}</span>
                       </div>
                       <p>${escapeHtml(r.snippet)}</p>
                       <div class="toolbar">
@@ -2169,7 +3419,7 @@ function renderPdfIntel() {
           <span class="step-badge">4</span>
           <h2>Summarize Indexed PDF</h2>
         </div>
-        <p class="small">Build a persistent GM-ready summary from indexed text, then reuse it across tabs.</p>
+        <p class="small">Build a persistent GM-ready brief from indexed text, then reuse it across tabs. Search/RAG works after indexing even if you never run this step.</p>
         <div class="row">
           <label>Indexed File
             <select data-pdf-summary-file>
@@ -2828,7 +4078,7 @@ function ensureAiHistory() {
   const cleaned = [];
   for (const entry of raw) {
     const role = str(entry?.role).toLowerCase();
-    const text = str(entry?.text).replace(/\s+/g, " ");
+    const text = normalizeAiHistoryText(entry?.text);
     if (!text) continue;
     if (role !== "user" && role !== "assistant") continue;
     if (role === "assistant" && isLikelyInstructionEcho(text)) continue;
@@ -2848,7 +4098,7 @@ function ensureAiHistory() {
 }
 
 function addAiHistoryTurn({ tabId, role, mode, text }) {
-  const message = str(text).replace(/\s+/g, " ");
+  const message = normalizeAiHistoryText(text);
   if (!message) return;
   const normalizedRole = str(role).toLowerCase();
   if (normalizedRole !== "user" && normalizedRole !== "assistant") return;
@@ -2863,6 +4113,26 @@ function addAiHistoryTurn({ tabId, role, mode, text }) {
   });
   state.meta.aiHistory = history.slice(-AI_HISTORY_LIMIT);
   saveState();
+}
+
+function normalizeAiHistoryText(text) {
+  const source = str(text).replace(/\r\n?/g, "\n");
+  if (!source) return "";
+  const lines = source.split("\n").map((line) => line.replace(/[ \t]+/g, " ").trimEnd());
+  const cleaned = [];
+  let lastBlank = false;
+  for (const line of lines) {
+    const normalized = line.trim() ? line : "";
+    if (!normalized) {
+      if (lastBlank) continue;
+      lastBlank = true;
+      cleaned.push("");
+      continue;
+    }
+    lastBlank = false;
+    cleaned.push(normalized);
+  }
+  return cleaned.join("\n").trim().slice(0, 1800);
 }
 
 function getRecentAiHistory(tabId, limit = 10) {
@@ -2886,6 +4156,12 @@ function getRecentAiHistory(tabId, limit = 10) {
     }
   }
   return picked.reverse();
+}
+
+function getAiHistoryEntryById(entryId) {
+  const target = str(entryId);
+  if (!target) return null;
+  return ensureAiHistory().find((entry) => entry.id === target) || null;
 }
 
 function buildAiModelOptions(currentModel, models) {
@@ -3088,6 +4364,7 @@ function getTabLabel(tabId) {
 function getGlobalCopilotPlaceholder(tabId) {
   if (tabId === "sessions") return "Ask for recap + next prep beats for the latest session.";
   if (tabId === "capture") return "Ask to transform live capture into clean session notes.";
+  if (tabId === "kingdom") return "Ask for kingdom-turn help, action order, leader assignments, or settlement advice.";
   if (tabId === "npcs") return "Describe an NPC concept and ask for table-ready details.";
   if (tabId === "quests") return "Describe a quest idea and ask for objective/stakes.";
   if (tabId === "locations") return "Describe a hex/location and ask for a usable scene brief.";
@@ -3100,7 +4377,8 @@ function getGlobalCopilotPlaceholder(tabId) {
 function getGlobalCopilotApplyLabel(tabId) {
   if (tabId === "sessions") return "Apply to Latest Session";
   if (tabId === "capture") return "Add as Live Capture";
-  if (tabId === "npcs") return "Create NPC";
+  if (tabId === "kingdom") return "Append Kingdom Notes";
+  if (tabId === "npcs") return "Create NPC(s)";
   if (tabId === "quests") return "Create Quest";
   if (tabId === "locations") return "Create Location";
   if (tabId === "pdf") return "Use as PDF Query";
@@ -3113,7 +4391,7 @@ function getGlobalCopilotMode(tabId) {
   if (tabId === "npcs") return "npc";
   if (tabId === "quests") return "quest";
   if (tabId === "locations") return "location";
-  if (tabId === "sessions" || tabId === "capture" || tabId === "writing") return "session";
+  if (tabId === "sessions" || tabId === "capture" || tabId === "writing" || tabId === "kingdom") return "session";
   return "prep";
 }
 
@@ -3155,6 +4433,18 @@ function compactCopilotRequestText(inputText, max = 420) {
   return `${cut.trim()}...`;
 }
 
+function isPdfGroundedQuestion(inputText) {
+  const lower = str(inputText).toLowerCase();
+  if (!lower) return false;
+  return /\b(selected pdf|this book|the book|book|pdf|adventure|module|chapter|section|main threat|run chapter|run it|run this)\b/.test(
+    lower
+  );
+}
+
+function isPdfGroundedWorldRequest(tabId, inputText) {
+  return isStructuredWorldTab(tabId) && isPdfGroundedQuestion(inputText);
+}
+
 function shouldUseCopilotChatMode(tabId, inputText) {
   const text = str(inputText);
   if (!text) return false;
@@ -3165,6 +4455,9 @@ function shouldUseCopilotChatMode(tabId, inputText) {
       lower
     )
   ) {
+    return false;
+  }
+  if (isPdfGroundedQuestion(lower)) {
     return false;
   }
   if (/^(hi|hello|hey|yo)\b/.test(lower)) return true;
@@ -3199,11 +4492,20 @@ function buildGlobalCopilotRequest(tabId, userInput, autoRun) {
     };
   }
   const inferredMode = inferStructuredModeFromInput(cleanInput);
+  if (isPdfGroundedWorldRequest(tabId, cleanInput) && !isCopilotSmallTalkInput(cleanInput)) {
+    return {
+      mode: baseMode,
+      input: buildPdfGroundedWorldPrompt(tabId, cleanInput),
+      isChat: false,
+    };
+  }
   if (inferredMode && !isCopilotSmallTalkInput(cleanInput)) {
     const compactInput = compactCopilotRequestText(cleanInput, inferredMode === "npc" ? 420 : 340);
     return {
       mode: inferredMode,
-      input: `${buildGlobalCopilotSeedPrompt(getSeedTabForMode(inferredMode))}\nKeep every field concise, story-tied, and table-ready.\n\nAdditional request:\n${compactInput}`,
+      input: `${buildGlobalCopilotSeedPrompt(getSeedTabForMode(inferredMode))}\n${getStructuredWorldDetailInstruction(
+        getSeedTabForMode(inferredMode)
+      )}\n\nAdditional request:\n${compactInput}`,
       isChat: false,
     };
   }
@@ -3211,7 +4513,29 @@ function buildGlobalCopilotRequest(tabId, userInput, autoRun) {
     const compactInput = compactCopilotRequestText(cleanInput, tabId === "npcs" ? 420 : 340);
     return {
       mode: baseMode,
-      input: `${seedPrompt}\nKeep every field concise, story-tied, and table-ready.\n\nAdditional request:\n${compactInput}`,
+      input: `${seedPrompt}\n${getStructuredWorldDetailInstruction(tabId)}\n\nAdditional request:\n${compactInput}`,
+      isChat: false,
+    };
+  }
+  if ((tabId === "pdf" || isPdfGroundedQuestion(cleanInput)) && !isCopilotSmallTalkInput(cleanInput)) {
+    const compactInput = compactCopilotRequestText(cleanInput, 420);
+    return {
+      mode: "prep",
+      input: [
+        "Use the selected PDF summary and indexed PDF snippets to answer the GM's question.",
+        "If the available PDF context is thin or missing, say that clearly instead of guessing.",
+        "Return:",
+        "Book Takeaways:",
+        "- 3 to 6 bullets grounded in the PDF context",
+        "How To Run It:",
+        "- 4 to 8 GM-facing bullets",
+        "Next PDF Queries:",
+        "- bullet",
+        "- bullet",
+        "",
+        "GM question:",
+        compactInput,
+      ].join("\n"),
       isChat: false,
     };
   }
@@ -3248,6 +4572,56 @@ function isCopilotSmallTalkInput(inputText) {
   return false;
 }
 
+function getStructuredWorldDetailInstruction(tabId) {
+  if (tabId === "npcs") {
+    return "Keep every field concrete, story-tied, and table-ready. Under Notes include 6 to 8 short bullets covering core want, leverage, pressure, voice, first impression, hidden truth or complication, and how to use the NPC at the table.";
+  }
+  if (tabId === "quests") {
+    return "Keep every field concrete, story-tied, and table-ready. Make the stakes specific and the next actionable beat obvious.";
+  }
+  if (tabId === "locations") {
+    return "Keep every field concrete, story-tied, and table-ready. Make the change, immediate tension, and next clue clearly usable at the table.";
+  }
+  return "Keep every field concrete, story-tied, and table-ready.";
+}
+
+function buildPdfGroundedWorldPrompt(tabId, userInput) {
+  const compactInput = compactCopilotRequestText(userInput, tabId === "npcs" ? 520 : 420);
+  if (tabId === "npcs") {
+    return [
+      "Use the selected PDF summary and indexed PDF snippets as the source of truth.",
+      "Base the answer on named or clearly implied people, factions, allies, rivals, and pressures from that book.",
+      "If the GM asks for a few or multiple NPCs, return 2 to 4 NPCs separated by a line containing only ---.",
+      "If the book context clearly supports fewer than requested, return only the strongest confirmed NPCs and mark inferred roles as inferred instead of inventing unsupported lore.",
+      "For each NPC, return exactly this structure:",
+      "Name:",
+      "Role:",
+      "Agenda:",
+      "Disposition:",
+      "Notes:",
+      "- Book anchor:",
+      "- Why the party works with or against them:",
+      "- Current pressure or fear:",
+      "- Voice and mannerisms:",
+      "- First impression or look:",
+      "- Hidden truth or complication:",
+      "- Best way to use them in the next session:",
+      "",
+      "GM request:",
+      compactInput,
+    ].join("\n");
+  }
+  return [
+    "Use the selected PDF summary and indexed PDF snippets as the source of truth.",
+    "Keep every detail grounded in that book and say when a detail is not confirmed instead of guessing.",
+    buildGlobalCopilotSeedPrompt(tabId),
+    getStructuredWorldDetailInstruction(tabId),
+    "",
+    "GM request:",
+    compactInput,
+  ].join("\n");
+}
+
 function buildGlobalCopilotSeedPrompt(tabId) {
   if (tabId === "dashboard") {
     return [
@@ -3278,14 +4652,39 @@ function buildGlobalCopilotSeedPrompt(tabId) {
       "- bullet",
     ].join("\n");
   }
+  if (tabId === "kingdom") {
+    return [
+      "Using the active V&K kingdom rules profile and current kingdom state, help the GM run the next kingdom turn.",
+      "Return:",
+      "Kingdom Turn Focus:",
+      "- 3 to 6 bullets",
+      "Recommended Action Order:",
+      "1. one concrete action",
+      "2. one concrete action",
+      "3. one concrete action",
+      "Risks To Watch:",
+      "- bullet",
+      "- bullet",
+      "What To Record In DM Helper:",
+      "- bullet",
+      "- bullet",
+    ].join("\n");
+  }
   if (tabId === "npcs") {
     return [
-      "Create one table-ready NPC and return fields exactly:",
+      "Create one table-ready NPC and return fields exactly in this structure:",
       "Name:",
       "Role:",
       "Agenda:",
       "Disposition:",
       "Notes:",
+      "- Core want:",
+      "- Leverage over the party or locals:",
+      "- Current pressure or fear:",
+      "- Voice and mannerisms:",
+      "- First impression or look:",
+      "- Hidden truth or complication:",
+      "- Best way to use them in the next session:",
     ].join("\n");
   }
   if (tabId === "quests") {
@@ -3330,6 +4729,13 @@ function buildGlobalCopilotSeedPrompt(tabId) {
 function buildGlobalCopilotContext(tabId) {
   const context = collectAiCampaignContext();
   const latest = getLatestSession();
+  const indexedFiles = Array.isArray(state?.meta?.pdfIndexedFiles)
+    ? state.meta.pdfIndexedFiles.map((name) => str(name)).filter(Boolean)
+    : [];
+  const selectedPdfFile =
+    str(ui.pdfSummaryFile) && indexedFiles.includes(str(ui.pdfSummaryFile)) ? str(ui.pdfSummaryFile) : indexedFiles[0] || "";
+  const summaryEntry = getPdfSummaryByFileName(selectedPdfFile);
+  const selectedPdfSummary = str(summaryEntry?.summary).replace(/\s+/g, " ").slice(0, 900);
   const aiHistory = getRecentAiHistory(tabId, 10)
     .filter((turn) => turn.role === "user" || !isLikelyInstructionEcho(turn.text))
     .map((turn) => ({
@@ -3354,17 +4760,30 @@ function buildGlobalCopilotContext(tabId) {
     tabContext = `Latest session summary: ${str(latest?.summary)} | Next prep: ${str(latest?.nextPrep)}`;
   } else if (tabId === "capture") {
     tabContext = `Recent live capture: ${recentCapture.join(" | ") || "No capture entries yet."}`;
+  } else if (tabId === "kingdom") {
+    const kingdom = getKingdomState();
+    const profile = getActiveKingdomProfile();
+    tabContext = `Kingdom: ${kingdom.name || "Unnamed kingdom"} | Turn: ${kingdom.currentTurnLabel || "Not set"} | Level ${kingdom.level} | Size ${kingdom.size} | Control DC ${
+      kingdom.controlDC
+    } | Unrest ${kingdom.unrest} | Renown ${kingdom.renown} | Fame ${kingdom.fame} | Infamy ${kingdom.infamy} | Settlements ${
+      kingdom.settlements.length
+    } | Claimed regions ${kingdom.regions.length} | Active profile: ${profile?.shortLabel || profile?.label || "Unknown"}`;
   } else if (tabId === "npcs") {
-    tabContext = `Current NPC names: ${state.npcs.slice(0, 15).map((n) => n.name).join(", ")}`;
+    tabContext = `Current NPC names: ${state.npcs.slice(0, 15).map((n) => n.name).join(", ") || "None"}${
+      selectedPdfFile ? ` | Selected PDF: ${selectedPdfFile} | Selected PDF summary: ${selectedPdfSummary || "No summary yet."}` : ""
+    }`;
   } else if (tabId === "quests") {
-    tabContext = `Current quests: ${state.quests.slice(0, 15).map((q) => `${q.title} (${q.status})`).join("; ")}`;
+    tabContext = `Current quests: ${state.quests.slice(0, 15).map((q) => `${q.title} (${q.status})`).join("; ") || "None"}${
+      selectedPdfFile ? ` | Selected PDF: ${selectedPdfFile} | Selected PDF summary: ${selectedPdfSummary || "No summary yet."}` : ""
+    }`;
   } else if (tabId === "locations") {
-    tabContext = `Known locations: ${state.locations.slice(0, 15).map((l) => l.name).join(", ")}`;
+    tabContext = `Known locations: ${state.locations.slice(0, 15).map((l) => l.name).join(", ") || "None"}${
+      selectedPdfFile ? ` | Selected PDF: ${selectedPdfFile} | Selected PDF summary: ${selectedPdfSummary || "No summary yet."}` : ""
+    }`;
   } else if (tabId === "pdf") {
     const snippets = ui.pdfSearchResults.slice(0, 4).map((r) => `${r.fileName}: ${r.snippet}`);
-    const summaryEntry = getPdfSummaryByFileName(ui.pdfSummaryFile);
-    const summaryText = str(summaryEntry?.summary).replace(/\s+/g, " ").slice(0, 420);
-    tabContext = `PDF query: ${ui.pdfSearchQuery || "(none)"} | Snippets: ${
+    const summaryText = selectedPdfSummary.slice(0, 420);
+    tabContext = `Selected PDF: ${selectedPdfFile || "(none)"} | PDF query: ${ui.pdfSearchQuery || "(none)"} | Snippets: ${
       snippets.join(" || ") || "No snippets yet."
     } | Selected PDF summary: ${summaryText || "No summary yet."}`;
   } else if (tabId === "foundry") {
@@ -3378,6 +4797,8 @@ function buildGlobalCopilotContext(tabId) {
     activeTab: tabId,
     tabLabel: getTabLabel(tabId),
     tabContext,
+    selectedPdfFile,
+    selectedPdfSummary,
     aiHistory,
   };
 }
@@ -3463,8 +4884,19 @@ async function runGlobalAiCopilot(options = {}) {
   const input = request.input;
   const effectiveConfig = { ...config };
   if (!request.isChat && isStructuredWorldTab(activeTab)) {
-    effectiveConfig.maxOutputTokens = Math.min(Math.max(Number(effectiveConfig.maxOutputTokens || 0) || 0, 280), 480);
+    const worldOutputFloor = activeTab === "npcs" ? 420 : 280;
+    const worldOutputCeiling = activeTab === "npcs" ? 640 : 480;
+    effectiveConfig.maxOutputTokens = Math.min(
+      Math.max(Number(effectiveConfig.maxOutputTokens || 0) || 0, worldOutputFloor),
+      worldOutputCeiling
+    );
     effectiveConfig.timeoutSec = Math.max(Number(effectiveConfig.timeoutSec || 0), 300);
+    effectiveConfig.compactContext = true;
+  }
+  if (!request.isChat && (activeTab === "pdf" || isPdfGroundedQuestion(userInput || input))) {
+    effectiveConfig.maxOutputTokens = Math.max(Number(effectiveConfig.maxOutputTokens || 0) || 0, 900);
+    effectiveConfig.timeoutSec = Math.max(Number(effectiveConfig.timeoutSec || 0), 420);
+    effectiveConfig.temperature = Math.min(Number(effectiveConfig.temperature || 0.2) || 0.2, 0.15);
     effectiveConfig.compactContext = true;
   }
   if (!request.isChat && activeTab === "sessions") {
@@ -3543,6 +4975,51 @@ async function runGlobalAiCopilot(options = {}) {
       }
     }
 
+    const isPdfFocusedRequest =
+      !request.isChat &&
+      (
+        activeTab === "pdf" ||
+        isPdfGroundedQuestion(userInput) ||
+        isPdfGroundedQuestion(input)
+      );
+
+    const shouldForcePdfRetry =
+      isPdfFocusedRequest &&
+      (
+        finalAttempt.usedFallback ||
+        activeTab === "pdf" ||
+        activeTab === "npcs" ||
+        str(finalAttempt.processed.text).length < (activeTab === "npcs" ? 320 : 220)
+      );
+
+    if (shouldForcePdfRetry) {
+      const selectedPdfFile = str(buildGlobalCopilotContext(activeTab)?.selectedPdfFile) || "the selected PDF";
+      const pdfRetryPrompt = buildPdfFocusedRetryPrompt(activeTab, selectedPdfFile, userInput || input);
+      const pdfRetryConfig = {
+        ...effectiveConfig,
+        maxOutputTokens: Math.max(Number(effectiveConfig.maxOutputTokens || 0) || 0, activeTab === "npcs" ? 1300 : 1100),
+        timeoutSec: Math.max(Number(effectiveConfig.timeoutSec || 0), 480),
+      };
+      pdfRetryConfig.timeoutMs = Math.max(15000, Number(pdfRetryConfig.timeoutSec || 0) * 1000);
+      const pdfRetryAttempt = await runCopilotAiAttempt({
+        mode: activeTab === "npcs" ? "npc" : "prep",
+        input: pdfRetryPrompt,
+        config: pdfRetryConfig,
+        tabId: activeTab,
+        userInput,
+      });
+      if (requestId !== ui.copilotActiveRequestId) return;
+      if (
+        !pdfRetryAttempt.usedFallback &&
+        (
+          finalAttempt.usedFallback ||
+          str(pdfRetryAttempt.processed.text).length > str(finalAttempt.processed.text).length
+        )
+      ) {
+        finalAttempt = pdfRetryAttempt;
+      }
+    }
+
     const shouldForceSessionExpand =
       activeTab === "sessions" &&
       !finalAttempt.usedFallback &&
@@ -3612,6 +5089,9 @@ async function runGlobalAiCopilot(options = {}) {
       } else {
         ui.copilotMessage = `Fallback used for ${getTabLabel(activeTab)} output (not saved to memory).`;
       }
+      if (activeTab === "pdf") {
+        ui.copilotMessage += " This fallback is generic and not grounded in PDF/book content.";
+      }
     } else {
       ui.copilotPendingFallbackMemory = null;
       if (request.isChat) {
@@ -3631,7 +5111,9 @@ async function runGlobalAiCopilot(options = {}) {
         input: userInput || input,
         tabId: activeTab,
       });
-      ui.copilotMessage = `Local AI timed out. Showing built-in fallback instead (not saved to memory). ${message}`;
+      ui.copilotMessage = `Local AI timed out. Showing built-in fallback instead (not saved to memory).${
+        activeTab === "pdf" ? " This fallback is generic and not grounded in PDF/book content." : ""
+      } ${message}`;
     } else {
       ui.copilotDraft.output = "";
       ui.copilotMessage = `AI generate failed: ${message}`;
@@ -3643,6 +5125,53 @@ async function runGlobalAiCopilot(options = {}) {
       render();
     }
   }
+}
+
+function buildPdfFocusedRetryPrompt(tabId, selectedPdfFile, requestText) {
+  const cleanRequest = str(requestText);
+  if (tabId === "npcs") {
+    return [
+      "Use only the selected PDF context already provided with this request.",
+      `Selected PDF: ${selectedPdfFile}`,
+      "Create table-ready NPCs grounded in the book.",
+      "If the GM asked for a few or multiple NPCs, return 2 to 4 NPCs separated by a line containing only ---.",
+      "Prefer named or clearly implied recurring figures the party is likely to meet early.",
+      "Do not invent unsupported lore. If a role is inferred from the book context, mark it as inferred in Notes.",
+      "For each NPC, answer in this exact structure:",
+      "Name:",
+      "Role:",
+      "Agenda:",
+      "Disposition:",
+      "Notes:",
+      "- Book anchor:",
+      "- Why the party works with or against them:",
+      "- Current pressure or fear:",
+      "- Voice and mannerisms:",
+      "- First impression or look:",
+      "- Hidden truth or complication:",
+      "- Best way to use them in the next session:",
+      "",
+      "GM request:",
+      cleanRequest,
+    ].join("\n");
+  }
+  return [
+    "Use only the selected PDF context already provided with this request.",
+    `Selected PDF: ${selectedPdfFile}`,
+    "Answer in this exact structure:",
+    "Main Threat Summary:",
+    "- 2 to 4 bullets grounded in the PDF",
+    "5 Ways To Run Chapter One:",
+    "1. one concrete GM approach",
+    "2. one concrete GM approach",
+    "3. one concrete GM approach",
+    "4. one concrete GM approach",
+    "5. one concrete GM approach",
+    "If a detail is not confirmed by the indexed PDF context, say it is not confirmed instead of guessing.",
+    "",
+    "GM request:",
+    cleanRequest,
+  ].join("\n");
 }
 
 async function copyGlobalAiOutput() {
@@ -3680,6 +5209,12 @@ async function applyGlobalAiOutput() {
   if (activeTab === "capture") {
     createCaptureEntry("AI", text, getResolvedCaptureSessionId());
     ui.copilotMessage = "Added AI output to live capture.";
+    render();
+    return;
+  }
+  if (activeTab === "kingdom") {
+    appendKingdomAiNote(text);
+    ui.copilotMessage = "Appended AI output to kingdom notes.";
     render();
     return;
   }
@@ -3788,6 +5323,48 @@ function extractLabeledBlock(text, label) {
   return match ? str(match[1]) : "";
 }
 
+function collectNpcSupplementalDetailLines(text) {
+  const fieldMap = [
+    ["Core Want", "Core want"],
+    ["Want", "Core want"],
+    ["Goal", "Core want"],
+    ["Leverage", "Leverage"],
+    ["Pressure", "Current pressure"],
+    ["Fear", "Current pressure"],
+    ["Voice", "Voice and mannerisms"],
+    ["Mannerisms", "Voice and mannerisms"],
+    ["First Impression", "First impression or look"],
+    ["Appearance", "First impression or look"],
+    ["Look", "First impression or look"],
+    ["Secret", "Hidden truth or complication"],
+    ["Hidden Truth", "Hidden truth or complication"],
+    ["Complication", "Hidden truth or complication"],
+    ["Hook", "Best way to use them in the next session"],
+    ["Use At Table", "Best way to use them in the next session"],
+    ["Use in Next Session", "Best way to use them in the next session"],
+  ];
+  const seenTitles = new Set();
+  const lines = [];
+  for (const [label, title] of fieldMap) {
+    const value = extractLabeledBlock(text, label).replace(/\s*\n+\s*/g, " ").trim();
+    if (!value || seenTitles.has(title.toLowerCase())) continue;
+    seenTitles.add(title.toLowerCase());
+    lines.push(`- ${title}: ${value}`);
+  }
+  return lines;
+}
+
+function buildNpcNotesFromAi(text) {
+  const baseNotes = extractLabeledBlock(text, "Notes");
+  const extraLines = collectNpcSupplementalDetailLines(text);
+  if (!baseNotes && !extraLines.length) return "";
+  if (!baseNotes) return extraLines.join("\n");
+
+  const existing = baseNotes.toLowerCase();
+  const freshLines = extraLines.filter((line) => !existing.includes(line.replace(/^- /, "").split(":")[0].toLowerCase()));
+  return [baseNotes, freshLines.join("\n")].filter(Boolean).join("\n");
+}
+
 function extractQueryFromAiOutput(text) {
   const labeled = extractLabeledBlock(text, "Query");
   if (labeled) return labeled.split(/\n/)[0].trim().slice(0, 120);
@@ -3798,25 +5375,64 @@ function extractQueryFromAiOutput(text) {
   return str(firstLine).replace(/^[-*]\s*/, "");
 }
 
+function splitNpcEntriesFromAi(text) {
+  const source = str(text).replace(/\r\n?/g, "\n").trim();
+  if (!source) return [];
+  const lines = source.split("\n");
+  const blocks = [];
+  let current = [];
+  for (const rawLine of lines) {
+    const line = str(rawLine);
+    if (/^---+\s*$/.test(line)) {
+      if (current.length) {
+        blocks.push(current.join("\n").trim());
+        current = [];
+      }
+      continue;
+    }
+    if (/^Name\s*:/i.test(line) && current.some((entry) => /^Name\s*:/i.test(entry))) {
+      blocks.push(current.join("\n").trim());
+      current = [line];
+      continue;
+    }
+    current.push(line);
+  }
+  if (current.length) blocks.push(current.join("\n").trim());
+  return blocks.filter(Boolean);
+}
+
 function createNpcFromAi(text) {
-  const name = extractLabeledBlock(text, "Name") || guessTitleFromText(text, "AI NPC");
-  const role = extractLabeledBlock(text, "Role");
-  const agenda = extractLabeledBlock(text, "Agenda");
-  const disposition = extractLabeledBlock(text, "Disposition") || "Neutral";
-  const notes = extractLabeledBlock(text, "Notes") || text;
+  const blocks = splitNpcEntriesFromAi(text);
   const now = new Date().toISOString();
-  state.npcs.unshift({
-    id: uid(),
-    name,
-    role,
-    agenda,
-    disposition,
-    notes,
-    createdAt: now,
-    updatedAt: now,
-  });
+  const createdNames = [];
+  for (const block of blocks.length ? blocks : [text]) {
+    const name = extractLabeledBlock(block, "Name") || guessTitleFromText(block, "AI NPC");
+    const role = extractLabeledBlock(block, "Role");
+    const agenda = extractLabeledBlock(block, "Agenda");
+    const disposition = extractLabeledBlock(block, "Disposition") || "Neutral";
+    const notes = buildNpcNotesFromAi(block) || block;
+    if (!name && !notes) continue;
+    state.npcs.unshift({
+      id: uid(),
+      name,
+      role,
+      agenda,
+      disposition,
+      notes,
+      createdAt: now,
+      updatedAt: now,
+    });
+    createdNames.push(name);
+  }
+  if (!createdNames.length) {
+    ui.copilotMessage = "Could not extract any NPCs from the AI output.";
+    render();
+    return;
+  }
   saveState();
-  ui.copilotMessage = `Created NPC: ${name}`;
+  ui.copilotMessage = createdNames.length === 1
+    ? `Created NPC: ${createdNames[0]}`
+    : `Created ${createdNames.length} NPCs: ${createdNames.slice(0, 3).join(", ")}${createdNames.length > 3 ? "..." : ""}`;
   render();
 }
 
@@ -4375,7 +5991,12 @@ async function runWritingHelperWithLocalAi() {
 
 function collectAiCampaignContext() {
   const latest = getLatestSession();
+  const kingdom = getKingdomState();
+  const kingdomProfile = getActiveKingdomProfile();
   const openQuests = state.quests.filter((q) => q.status !== "completed" && q.status !== "failed").slice(0, 6);
+  const recentSessions = [...state.sessions]
+    .sort((a, b) => safeDate(b.date || b.updatedAt || b.createdAt) - safeDate(a.date || a.updatedAt || a.createdAt))
+    .slice(0, 6);
   const indexedFiles = Array.isArray(state?.meta?.pdfIndexedFiles)
     ? state.meta.pdfIndexedFiles.map((name) => str(name)).filter(Boolean)
     : [];
@@ -4398,9 +6019,35 @@ function collectAiCampaignContext() {
           kingdomTurn: latest.kingdomTurn,
         }
       : null,
+    recentSessions: recentSessions.map((session) => ({
+      title: session.title,
+      date: session.date,
+      summary: session.summary,
+      nextPrep: session.nextPrep,
+      arc: session.arc,
+    })),
     openQuests: openQuests.map((q) => ({ title: q.title, objective: q.objective, stakes: q.stakes })),
-    npcs: state.npcs.slice(0, 12).map((n) => ({ name: n.name, role: n.role, agenda: n.agenda })),
-    locations: state.locations.slice(0, 10).map((l) => ({ name: l.name, hex: l.hex, notes: l.notes })),
+    quests: state.quests.slice(0, 12).map((q) => ({
+      title: q.title,
+      status: q.status,
+      objective: q.objective,
+      giver: q.giver,
+      stakes: q.stakes,
+    })),
+    npcs: state.npcs.slice(0, 12).map((n) => ({
+      name: n.name,
+      role: n.role,
+      agenda: n.agenda,
+      disposition: n.disposition,
+      notes: n.notes,
+    })),
+    locations: state.locations.slice(0, 10).map((l) => ({
+      name: l.name,
+      hex: l.hex,
+      whatChanged: l.whatChanged,
+      notes: l.notes,
+    })),
+    kingdom: buildKingdomAiContext(kingdom, kingdomProfile),
     pdfIndexedFileCount: Number.parseInt(String(state?.meta?.pdfIndexedCount || indexedFiles.length || 0), 10) || 0,
     pdfIndexedFiles: indexedFiles.slice(0, 60),
     pdfSummaryBriefs: summaryBriefs,
@@ -4609,6 +6256,50 @@ function splitIntoIdeaLines(text) {
     .filter(Boolean);
 }
 
+function countBulletLikeLines(text) {
+  return splitIntoIdeaLines(text).filter((line) => /^[-*]\s+/.test(line) || /^\d+[.)]\s+/.test(line)).length;
+}
+
+function isClearlyTruncatedOutput(text) {
+  const clean = str(text).trim();
+  if (!clean) return true;
+  const lines = splitIntoIdeaLines(clean);
+  const lastLine = lines[lines.length - 1] || clean;
+  if (/[:\-]\s*$/.test(lastLine)) return true;
+  if (/[.!?]$/.test(lastLine)) return false;
+  const lastWord = str(lastLine).toLowerCase().split(/\s+/).filter(Boolean).pop() || "";
+  if (
+    [
+      "a",
+      "an",
+      "the",
+      "and",
+      "or",
+      "to",
+      "of",
+      "in",
+      "on",
+      "with",
+      "for",
+      "from",
+      "is",
+      "are",
+      "was",
+      "were",
+      "that",
+      "this",
+      "these",
+      "those",
+      "as",
+      "at",
+      "by",
+    ].includes(lastWord)
+  ) {
+    return true;
+  }
+  return lines.length <= 2 && clean.length < 160;
+}
+
 function generateStructuredText(cleanedInput, mode) {
   const lines = splitIntoIdeaLines(cleanedInput);
   const joined = lines.join(" ");
@@ -4634,12 +6325,25 @@ function generateStructuredText(cleanedInput, mode) {
         : /\bvillage\b/.test(lower)
           ? "Village contact who knows more than they admit"
           : "Local contact with concealed leverage";
+    const pressure =
+      /\bsmuggl|contraband|dock|port\b/.test(lower)
+        ? "A shipment, payoff, or contact is about to expose them."
+        : /\bfrontier|road|wild\b/.test(lower)
+          ? "Violence on the road is closing off their safest options."
+          : "A stronger faction is forcing them to choose a side too soon.";
     return [
       "Name: Mara Vens",
       `Role: ${role}`,
       "Agenda: Protect the settlement while hiding one useful truth from the party.",
       "Disposition: Guarded but helpful",
-      "Notes: Knows more than they admit about the current threat or faction pressure. Use them to reveal clues in stages: rumor first, useful lead second, harder truth after trust or pressure.",
+      "Notes:",
+      "- Core want: Keep their position secure long enough to survive the current pressure.",
+      "- Leverage over the party or locals: They control one useful rumor, contact, or point of access the party needs.",
+      `- Current pressure or fear: ${pressure}`,
+      "- Voice and mannerisms: Low voice, clipped answers, and long pauses before saying anything costly.",
+      "- First impression or look: Travel-stained clothes, watchful eyes, and a habit of standing where they can see every exit.",
+      "- Hidden truth or complication: They already made one compromise with the wrong people and are trying to keep it buried.",
+      "- Best way to use them in the next session: Let them point the party toward the next lead, then reveal the harder truth only after trust, leverage, or pressure changes hands.",
     ].join("\n");
   }
 
@@ -4678,6 +6382,22 @@ function sanitizeAiTextOutput(rawText) {
   return cleaned.join("\n").trim();
 }
 
+function isWeakNpcOutput(text) {
+  const name = extractLabeledBlock(text, "Name");
+  const role = extractLabeledBlock(text, "Role");
+  const agenda = extractLabeledBlock(text, "Agenda");
+  const disposition = extractLabeledBlock(text, "Disposition");
+  const notes = buildNpcNotesFromAi(text);
+  if (!name || !role || !agenda || !disposition || !notes) return true;
+
+  const noteLines = splitIntoIdeaLines(notes);
+  const bulletCount = noteLines.filter((line) => /^[-*]\s+/.test(line)).length;
+  const noteChars = notes.replace(/\s+/g, " ").trim().length;
+  if (noteChars < 110) return true;
+  if (bulletCount > 0 && bulletCount < 4) return true;
+  return false;
+}
+
 function isLikelyWeakAiOutput(text, mode, input, tabId) {
   const clean = str(text).trim();
   if (!clean) return true;
@@ -4704,6 +6424,21 @@ function isLikelyWeakAiOutput(text, mode, input, tabId) {
     clean.length < 160
   ) {
     return true;
+  }
+
+  if ((str(mode).toLowerCase() === "npc" || tabId === "npcs") && isWeakNpcOutput(clean)) {
+    return true;
+  }
+
+  if (isClearlyTruncatedOutput(clean)) {
+    return true;
+  }
+
+  if (isPdfGroundedQuestion(lowerInput)) {
+    if (clean.length < 180) return true;
+    if (/\b(give me 5 ways|five ways|5 ways to run|ways to run)\b/.test(lowerInput) && countBulletLikeLines(clean) < 3) {
+      return true;
+    }
   }
 
   if (str(mode).toLowerCase() !== "assistant" && clean.length < 24) return true;
@@ -4814,13 +6549,41 @@ function generateCopilotFallbackByTab(tabId, input) {
       "- Push key entries into latest session log.",
     ].join("\n");
   }
+  if (tabId === "kingdom") {
+    return [
+      "Kingdom Turn Focus:",
+      "- Confirm Control DC, unrest, ruin, and consumption before spending actions.",
+      "- Assign specialized leader actions first, then use flexible actions to cover gaps.",
+      "- Check whether any civic structure, construction project, or event needs to resolve this turn.",
+      "",
+      "Recommended Action Order:",
+      "1. Resolve Upkeep changes, including leadership gaps and automatic kingdom effects.",
+      "2. Spend leader and settlement actions on the safest high-value activities for this turn.",
+      "3. Record RP, commodities, unrest, ruin, renown, fame, infamy, and pending construction changes.",
+      "",
+      "Risks To Watch:",
+      "- Rising unrest or ruin near the threshold can make the next event spiral fast.",
+      "- Consumption and local settlement limits can quietly punish overexpansion.",
+      "",
+      "What To Record In DM Helper:",
+      "- Which leaders acted, what changed, and which projects are still pending.",
+      "- Any rulings or reminders you need before the next kingdom turn.",
+    ].join("\n");
+  }
   if (tabId === "npcs") {
     return [
       "Name: Frontier Contact",
       "Role: Information broker",
       "Agenda: Gain leverage over local factions",
       "Disposition: Cautiously allied",
-      "Notes: Speaks in clipped sentences and trades favors, not coin.",
+      "Notes:",
+      "- Core want: Stay indispensable to every side without becoming owned by any one faction.",
+      "- Leverage over the party or locals: Holds a name, route, or hidden meeting place the party needs.",
+      "- Current pressure or fear: One local faction suspects they are selling information twice.",
+      "- Voice and mannerisms: Speaks in clipped sentences and never answers the exact question first.",
+      "- First impression or look: Polished boots, travel cloak, and the calm posture of someone who expects trouble.",
+      "- Hidden truth or complication: Their best source is a person the party would not trust on sight.",
+      "- Best way to use them in the next session: Introduce them as the fastest path to a lead, then make the price for help social rather than monetary.",
     ].join("\n");
   }
   if (tabId === "quests") {
@@ -4842,11 +6605,12 @@ function generateCopilotFallbackByTab(tabId, input) {
   }
   if (tabId === "pdf") {
     return [
-      "Query: travel hazards frontier route",
+      "Book Context Status: No PDF-grounded answer was generated here. This is a built-in fallback.",
+      "Query: adventure summary opening chapter",
       "Backup Queries:",
-      "- cursed road encounter design",
-      "- low level spirit or undead threats",
-      "Why: These terms find practical rules and encounter references quickly.",
+      "- main threat final chapter",
+      "- important NPCs clues chapter one",
+      "Why: Summarize the book or search for the specific section you want before asking again.",
     ].join("\n");
   }
   if (tabId === "foundry") {
@@ -4965,6 +6729,7 @@ function generateAssistantFallbackAnswer(input) {
       "Tell me what you want right now:",
       "- prep plan",
       "- encounter idea",
+      "- kingdom turn help",
       "- NPC or quest help",
       "- cleanup of rough notes",
     ].join("\n");
@@ -4972,7 +6737,7 @@ function generateAssistantFallbackAnswer(input) {
   if (/\b(who|what)\s+are\s+you\b/.test(lower)) {
     return [
       "I am your DM Helper Loremaster running on your local AI setup.",
-      "I can help with hooks, session prep, encounters, NPCs, quests, and note cleanup.",
+      "I can help with hooks, session prep, kingdom turns, encounters, NPCs, quests, and note cleanup.",
       "Ask me for one specific thing and I will draft it in table-ready format.",
     ].join("\n");
   }
@@ -4980,6 +6745,7 @@ function generateAssistantFallbackAnswer(input) {
     return [
       "I can help right now with:",
       "- Session hook ideas",
+      "- Kingdom turn planning and record updates",
       "- Encounter setup (objective, obstacle, consequence)",
       "- NPC or quest drafts",
       "- Cleanup of rough notes into clean prep text",
@@ -4988,7 +6754,7 @@ function generateAssistantFallbackAnswer(input) {
 
   if (isSourceScopeQuestionPrompt(lower)) {
     return [
-      "I only use your campaign data plus PDFs indexed in this app.",
+      "I only use your campaign data, the active kingdom rules profile if one is loaded, and PDFs indexed in this app.",
       "I do not have default access to external books.",
       "Open PDF Intel to index files, then ask what books are currently indexed.",
     ].join("\n");
@@ -5384,6 +7150,50 @@ async function handleFormSubmit(type, form) {
     return;
   }
 
+  if (type === "kingdom-overview") {
+    applyKingdomOverviewForm(fields);
+    saveState();
+    ui.kingdomMessage = "Kingdom overview updated.";
+    render();
+    return;
+  }
+
+  if (type === "kingdom-leader") {
+    createKingdomLeader(fields);
+    saveState();
+    form.reset();
+    ui.kingdomMessage = "Kingdom leader added.";
+    render();
+    return;
+  }
+
+  if (type === "kingdom-settlement") {
+    createKingdomSettlement(fields);
+    saveState();
+    form.reset();
+    ui.kingdomMessage = "Settlement added.";
+    render();
+    return;
+  }
+
+  if (type === "kingdom-region") {
+    createKingdomRegion(fields);
+    saveState();
+    form.reset();
+    ui.kingdomMessage = "Region record added.";
+    render();
+    return;
+  }
+
+  if (type === "kingdom-turn") {
+    applyKingdomTurnForm(fields);
+    saveState();
+    form.reset();
+    ui.kingdomMessage = "Kingdom turn applied and recorded.";
+    render();
+    return;
+  }
+
   if (type === "npcs") {
     const id = uid();
     const folder = normalizeWorldFolderName(fields.folder);
@@ -5499,11 +7309,41 @@ async function handleFormSubmit(type, form) {
   }
 }
 
+function getEntityCollectionRef(collection) {
+  const clean = str(collection);
+  if (!clean) return null;
+  if (clean === "kingdomLeaders") return getKingdomState().leaders;
+  if (clean === "kingdomSettlements") return getKingdomState().settlements;
+  if (clean === "kingdomRegions") return getKingdomState().regions;
+  if (clean === "kingdomTurns") return getKingdomState().turns;
+  return Array.isArray(state[clean]) ? state[clean] : null;
+}
+
+function normalizeEntityPatch(collection, patch) {
+  const cleanCollection = str(collection);
+  const out = {};
+  for (const [field, value] of Object.entries(patch || {})) {
+    if (cleanCollection === "kingdomLeaders" && field === "leadershipBonus") {
+      out[field] = Math.max(0, Math.min(4, Number.parseInt(String(value || "0"), 10) || 0));
+      continue;
+    }
+    if (cleanCollection === "kingdomSettlements" && ["influence", "resourceDice", "consumption"].includes(field)) {
+      out[field] = Math.max(0, Number.parseInt(String(value || "0"), 10) || 0);
+      continue;
+    }
+    out[field] = value;
+  }
+  return out;
+}
+
 function deleteEntity(collection, id) {
   if (!confirm("Delete this entry?")) return;
-  if (!Array.isArray(state[collection])) return;
-  state[collection] = state[collection].filter((item) => item.id !== id);
-  if (ui.worldSelection && collection in ui.worldSelection) {
+  const group = getEntityCollectionRef(collection);
+  if (!Array.isArray(group)) return;
+  const index = group.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  group.splice(index, 1);
+  if (ui.worldSelection && collection in ui.worldSelection && Array.isArray(state[collection])) {
     if (ui.worldSelection[collection] === id) {
       ui.worldSelection[collection] = state[collection][0]?.id || "";
     }
@@ -5513,11 +7353,11 @@ function deleteEntity(collection, id) {
 }
 
 function patchEntity(collection, id, patch) {
-  const group = state[collection];
+  const group = getEntityCollectionRef(collection);
   if (!Array.isArray(group)) return;
   const item = group.find((entry) => entry.id === id);
   if (!item) return;
-  Object.assign(item, patch, { updatedAt: new Date().toISOString() });
+  Object.assign(item, normalizeEntityPatch(collection, patch), { updatedAt: new Date().toISOString() });
   saveState();
 }
 
@@ -5734,6 +7574,7 @@ async function runPdfSearch(query, limit = 20) {
   if (!desktopApi) return;
   const normalizedQuery = str(query);
   const normalizedLimit = Number.parseInt(String(limit || "20"), 10) || 20;
+  const aiConfig = ensureAiConfig();
   ui.pdfSearchQuery = normalizedQuery;
 
   if (!normalizedQuery) {
@@ -5747,9 +7588,24 @@ async function runPdfSearch(query, limit = 20) {
   ui.pdfMessage = "Searching indexed PDFs...";
   render();
   try {
-    const result = await desktopApi.searchPdf({ query: normalizedQuery, limit: normalizedLimit });
+    const result = await desktopApi.searchPdf({ query: normalizedQuery, limit: normalizedLimit, config: aiConfig });
     ui.pdfSearchResults = Array.isArray(result.results) ? result.results : [];
-    ui.pdfMessage = `Found ${ui.pdfSearchResults.length} result(s).`;
+    const retrievalMode = str(result?.retrieval?.mode || "");
+    const embeddingModel = str(result?.retrieval?.embeddingModel || "");
+    const retrievalNote = str(result?.retrieval?.note || "");
+    if (ui.pdfSearchResults.length) {
+      if (retrievalMode === "hybrid" && embeddingModel) {
+        ui.pdfMessage = `Found ${ui.pdfSearchResults.length} result(s) using hybrid search with ${embeddingModel}.`;
+      } else if (retrievalMode === "semantic" && embeddingModel) {
+        ui.pdfMessage = `Found ${ui.pdfSearchResults.length} result(s) using semantic search with ${embeddingModel}.`;
+      } else if (retrievalMode === "lexical" && retrievalNote) {
+        ui.pdfMessage = `Found ${ui.pdfSearchResults.length} result(s). ${retrievalNote}`;
+      } else {
+        ui.pdfMessage = `Found ${ui.pdfSearchResults.length} result(s).`;
+      }
+    } else {
+      ui.pdfMessage = retrievalNote || "No PDF matches found.";
+    }
   } catch (err) {
     ui.pdfMessage = `Search failed: ${String(err)}`;
     ui.pdfSearchResults = [];
@@ -6000,6 +7856,7 @@ function normalizeState(input) {
       locations: Array.isArray(out.meta.worldFolders.locations) ? out.meta.worldFolders.locations : [],
     };
   }
+  out.kingdom = normalizeKingdomState(out.kingdom);
   out.sessions = Array.isArray(out.sessions) ? out.sessions : [];
   out.npcs = Array.isArray(out.npcs) ? out.npcs : [];
   out.quests = Array.isArray(out.quests) ? out.quests : [];
@@ -6128,6 +7985,7 @@ function createStarterState() {
         updatedAt: new Date().toISOString(),
       },
     ],
+    kingdom: createStarterKingdomState(),
     liveCapture: [],
   };
 }
