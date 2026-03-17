@@ -12,6 +12,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $sourceLauncher = Join-Path $PSScriptRoot 'launch-dm-helper.cmd'
 $portableExe = Join-Path $repoRoot 'dist\DM Helper 0.1.0.exe'
 $unpackedExe = Join-Path $repoRoot 'dist\win-unpacked\DM Helper.exe'
+$shortcutIcon = Join-Path $repoRoot 'build\icon.ico'
 $electronExe = Join-Path $repoRoot 'node_modules\electron\dist\electron.exe'
 
 if (-not $ShortcutPath) {
@@ -44,10 +45,12 @@ if ($TargetPath -eq $sourceLauncher) {
   $workingDirectory = $repoRoot
 }
 
-$iconLocation = if (Test-Path $portableExe) {
-  $portableExe
+$iconLocation = if (Test-Path $shortcutIcon) {
+  $shortcutIcon
 } elseif (Test-Path $electronExe) {
   $electronExe
+} elseif (Test-Path $portableExe) {
+  $portableExe
 } elseif (Test-Path $unpackedExe) {
   $unpackedExe
 } else {
