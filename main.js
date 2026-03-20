@@ -13,7 +13,11 @@ const AI_TIMEOUT_MS = 120000;
 const AI_PDF_SNIPPET_LIMIT = 6;
 const OLLAMA_BOOT_RETRY_COUNT = 12;
 const OLLAMA_BOOT_RETRY_DELAY_MS = 1000;
+const OBSIDIAN_AI_CONTEXT_FILE_SCAN_LIMIT = 400;
+const OBSIDIAN_AI_CONTEXT_DEFAULT_NOTE_LIMIT = 6;
+const OBSIDIAN_AI_CONTEXT_DEFAULT_CHAR_LIMIT = 3600;
 const PDF_INDEX_CACHE_FILENAME = "pdf-index-cache.v1.json";
+const AON_RULES_CACHE_FILENAME = "aon-rules-cache.v1.json";
 const PDF_RETRIEVAL_CHUNK_SIZE = 1400;
 const PDF_RETRIEVAL_CHUNK_OVERLAP = 240;
 const PDF_EMBED_BATCH_SIZE = 16;
@@ -31,6 +35,11 @@ const PDF_EMBEDDING_MODEL_CANDIDATES = [
   "mxbai-embed-large:latest",
   "mxbai-embed-large",
 ];
+const AON_RULES_INDEX_URL = "https://2e.aonprd.com/Rules.aspx";
+const AON_RULES_BASE_URL = "https://2e.aonprd.com/";
+const AON_RULES_INDEX_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 7;
+const AON_RULES_PAGE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
+const AON_RULES_MAX_MATCHES = 6;
 const AI_MODEL_LABELS = Object.freeze({
   "lorebound-pf2e:latest": "LoreBound PF2e Deep (20B)",
   "lorebound-pf2e-fast:latest": "LoreBound PF2e Fast (20B)",
@@ -57,6 +66,11 @@ let pdfIndexCache = {
   folderPath: "",
   indexedAt: "",
   files: [],
+};
+let aonRulesCache = {
+  indexedAt: "",
+  entries: [],
+  pages: {},
 };
 let ollamaBootPromise = null;
 let pdfEmbeddingModelCache = {
@@ -106,10 +120,23 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, "index.html"));
   wireSpellcheckContextMenu(mainWindow);
+  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    safeMainLog("renderer-console", `${sourceId || "renderer"}:${line || 0} [${level}] ${message}`);
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    safeMainLog("render-process-gone", `${details?.reason || "unknown"} exitCode=${details?.exitCode ?? "n/a"}`);
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    safeMainLog(
+      "did-fail-load",
+      `${isMainFrame ? "main" : "sub"} frame ${validatedURL || "unknown-url"} code=${errorCode} ${errorDescription || ""}`.trim()
+    );
+  });
 }
 
 app.whenReady().then(async () => {
   await loadPdfIndexCacheFromDisk();
+  await loadAonRulesCacheFromDisk();
   registerIpc();
   createWindow();
 
@@ -171,6 +198,830 @@ function getAiModelDisplayName(model) {
 
 function getPdfIndexCachePath() {
   return path.join(app.getPath("userData"), PDF_INDEX_CACHE_FILENAME);
+}
+
+function getAonRulesCachePath() {
+  return path.join(app.getPath("userData"), AON_RULES_CACHE_FILENAME);
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safeDate(value) {
+  const ms = Date.parse(String(value || ""));
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
+function sanitizeAonRulesEntry(entry) {
+  const title = decodeHtmlEntities(String(entry?.title || "")).replace(/\s+/g, " ").trim();
+  const url = String(entry?.url || "").trim();
+  const pathValue = String(entry?.path || "").trim();
+  if (!title || !url || !pathValue) return null;
+  if (!/^https:\/\/2e\.aonprd\.com\/Rules\.aspx\?/i.test(url)) return null;
+  return {
+    title,
+    url,
+    path: pathValue,
+  };
+}
+
+function sanitizeAonRulesPage(page) {
+  const title = decodeHtmlEntities(String(page?.title || "")).replace(/\s+/g, " ").trim();
+  const url = String(page?.url || "").trim();
+  const snippet = String(page?.snippet || "").replace(/\s+/g, " ").trim();
+  const fetchedAt = String(page?.fetchedAt || "").trim();
+  if (!title || !url) return null;
+  return {
+    title,
+    url,
+    snippet,
+    fetchedAt,
+  };
+}
+
+function sanitizeAonRulesCache(rawCache) {
+  const entries = Array.isArray(rawCache?.entries) ? rawCache.entries.map((entry) => sanitizeAonRulesEntry(entry)).filter(Boolean) : [];
+  const pagesRaw = rawCache?.pages && typeof rawCache.pages === "object" && !Array.isArray(rawCache.pages) ? rawCache.pages : {};
+  const pages = {};
+  for (const [key, value] of Object.entries(pagesRaw)) {
+    const clean = sanitizeAonRulesPage(value);
+    if (clean) pages[key] = clean;
+  }
+  return {
+    indexedAt: String(rawCache?.indexedAt || "").trim(),
+    entries,
+    pages,
+  };
+}
+
+async function loadAonRulesCacheFromDisk() {
+  try {
+    const cachePath = getAonRulesCachePath();
+    const raw = await fs.readFile(cachePath, "utf8");
+    aonRulesCache = sanitizeAonRulesCache(JSON.parse(raw));
+  } catch {
+    aonRulesCache = {
+      indexedAt: "",
+      entries: [],
+      pages: {},
+    };
+  }
+}
+
+async function saveAonRulesCacheToDisk() {
+  const cachePath = getAonRulesCachePath();
+  await fs.writeFile(cachePath, JSON.stringify(sanitizeAonRulesCache(aonRulesCache)), "utf8");
+}
+
+async function fetchTextWithTimeout(url, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs) || 15000));
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "DM-Helper/0.1.0 (+PF2e rules lookup)",
+        Accept: "text/html,application/xhtml+xml",
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.text();
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round((Number(timeoutMs) || 15000) / 1000)}s.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || "")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, "\"")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ");
+}
+
+function stripHtmlToText(html) {
+  return decodeHtmlEntities(
+    String(html || "")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<\/div>/gi, "\n")
+      .replace(/<\/li>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{2,}/g, "\n")
+    .replace(/\s*\n\s*/g, "\n")
+    .trim();
+}
+
+function parseAonRulesIndex(html) {
+  const seen = new Map();
+  const regex = /<a[^>]+href="([^"]*Rules\.aspx\?[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match = regex.exec(String(html || ""));
+  while (match) {
+    const href = String(match[1] || "").trim();
+    const title = stripHtmlToText(String(match[2] || ""));
+    try {
+      const url = new URL(href, AON_RULES_BASE_URL);
+      if (url.hostname.toLowerCase() === "2e.aonprd.com" && url.pathname.endsWith("/Rules.aspx")) {
+        const clean = sanitizeAonRulesEntry({
+          title,
+          url: url.href,
+          path: `${url.pathname.replace(/^\//, "")}${url.search}`,
+        });
+        if (clean && !seen.has(clean.url)) {
+          seen.set(clean.url, clean);
+        }
+      }
+    } catch {
+      // Ignore malformed links.
+    }
+    match = regex.exec(String(html || ""));
+  }
+  return [...seen.values()].sort((a, b) => a.title.localeCompare(b.title));
+}
+
+function extractAonPageTitle(html, fallbackUrl = "") {
+  const titleMatch = String(html || "").match(/<title>([\s\S]*?)<\/title>/i);
+  const fromTitle = stripHtmlToText(titleMatch?.[1] || "").replace(/\s*\|\s*Archives of Nethys.*$/i, "").trim();
+  if (fromTitle) return fromTitle;
+  try {
+    const url = new URL(fallbackUrl);
+    return `${url.pathname.replace(/^\//, "")}${url.search}`;
+  } catch {
+    return fallbackUrl || "Rules Page";
+  }
+}
+
+function buildAonRuleSnippet(html, title) {
+  const text = stripHtmlToText(html);
+  if (!text) return "";
+  const lowered = text.toLowerCase();
+  const titleLower = String(title || "").toLowerCase();
+  const titleHit = titleLower ? lowered.indexOf(titleLower) : -1;
+  const start = titleHit >= 0 ? Math.min(text.length, titleHit + title.length) : 0;
+  const candidate = text.slice(start).trim() || text;
+  return candidate.slice(0, 900).trim();
+}
+
+async function ensureAonRulesIndex(force = false) {
+  const indexedAt = safeDate(aonRulesCache.indexedAt);
+  const cacheFresh = Number.isFinite(indexedAt) && Date.now() - indexedAt < AON_RULES_INDEX_MAX_AGE_MS;
+  if (!force && cacheFresh && Array.isArray(aonRulesCache.entries) && aonRulesCache.entries.length) {
+    return aonRulesCache.entries;
+  }
+  const html = await fetchTextWithTimeout(AON_RULES_INDEX_URL, 20000);
+  const entries = parseAonRulesIndex(html);
+  if (!entries.length) {
+    throw new Error("Could not parse Archives of Nethys rules index.");
+  }
+  aonRulesCache.entries = entries;
+  aonRulesCache.indexedAt = new Date().toISOString();
+  await saveAonRulesCacheToDisk();
+  return entries;
+}
+
+async function ensureAonRulePage(url) {
+  const safeUrl = String(url || "").trim();
+  if (!safeUrl) throw new Error("AoN rule URL is required.");
+  const cached = sanitizeAonRulesPage(aonRulesCache.pages?.[safeUrl]);
+  const fetchedAt = safeDate(cached?.fetchedAt);
+  const cacheFresh = Number.isFinite(fetchedAt) && Date.now() - fetchedAt < AON_RULES_PAGE_MAX_AGE_MS;
+  if (cached && cacheFresh && cached.snippet) {
+    return cached;
+  }
+  const html = await fetchTextWithTimeout(safeUrl, 20000);
+  const title = extractAonPageTitle(html, safeUrl);
+  const page = sanitizeAonRulesPage({
+    title,
+    url: safeUrl,
+    snippet: buildAonRuleSnippet(html, title),
+    fetchedAt: new Date().toISOString(),
+  });
+  if (!page) {
+    throw new Error("Could not parse Archives of Nethys rule page.");
+  }
+  aonRulesCache.pages[safeUrl] = page;
+  await saveAonRulesCacheToDisk();
+  return page;
+}
+
+async function searchAonRules(query, limit = 4, options = {}) {
+  const cleanQuery = normalizePdfText(query);
+  if (!cleanQuery) return { query: "", indexedAt: aonRulesCache.indexedAt, results: [] };
+  const entries = await ensureAonRulesIndex(options.force === true);
+  const searchParts = buildSearchParts(cleanQuery);
+  const ranked = entries
+    .map((entry) => {
+      const textLower = `${entry.title} ${entry.path}`.toLowerCase();
+      const match = scoreTextAgainstQuery(textLower, searchParts);
+      return {
+        ...entry,
+        score: match.score,
+        firstHit: match.firstHit,
+      };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
+    .slice(0, Math.max(1, Math.min(Number(limit) || 4, AON_RULES_MAX_MATCHES)));
+
+  const results = [];
+  for (const entry of ranked) {
+    try {
+      const page = await ensureAonRulePage(entry.url);
+      results.push({
+        title: page.title || entry.title,
+        url: entry.url,
+        path: entry.path,
+        snippet: makeSnippet(page.snippet || entry.title, entry.firstHit),
+        score: entry.score,
+        source: "Archives of Nethys",
+      });
+    } catch {
+      results.push({
+        title: entry.title,
+        url: entry.url,
+        path: entry.path,
+        snippet: entry.title,
+        score: entry.score,
+        source: "Archives of Nethys",
+      });
+    }
+  }
+
+  return {
+    query: cleanQuery,
+    indexedAt: aonRulesCache.indexedAt,
+    results,
+  };
+}
+
+function sanitizeVaultFileName(value, fallback = "Untitled") {
+  const clean = String(value || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "");
+  return (clean || fallback).slice(0, 110);
+}
+
+function uniqueVaultNoteName(baseName, usedNames) {
+  const seed = sanitizeVaultFileName(baseName, "Untitled");
+  const set = usedNames || new Set();
+  let candidate = seed;
+  let index = 2;
+  while (set.has(candidate.toLowerCase())) {
+    candidate = `${seed} ${index}`;
+    index += 1;
+  }
+  set.add(candidate.toLowerCase());
+  return candidate;
+}
+
+function mdText(value) {
+  return String(value ?? "").replace(/\r\n/g, "\n").trim();
+}
+
+function mdLine(value, fallback = "_None_") {
+  const clean = mdText(value);
+  return clean || fallback;
+}
+
+function mdBullets(items, fallback = "_None_") {
+  const clean = Array.isArray(items)
+    ? items.map((item) => mdText(item)).filter(Boolean)
+    : [];
+  return clean.length ? clean.map((item) => `- ${item}`).join("\n") : fallback;
+}
+
+function mdWikiLink(folder, noteName, label = "") {
+  const cleanFolder = String(folder || "").trim();
+  const target = cleanFolder && cleanFolder !== "." ? `${cleanFolder}/${noteName}` : `${noteName}`;
+  return label ? `[[${target}|${label}]]` : `[[${target}]]`;
+}
+
+async function writeVaultMarkdownFile(rootFolder, relativeSegments, content) {
+  const targetPath = path.join(rootFolder, ...relativeSegments);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, `${String(content || "").trim()}\n`, "utf8");
+  return targetPath;
+}
+
+function buildSessionNote(entry) {
+  return [
+    `# ${entry.title || "Session"}`,
+    "",
+    `- Date: ${mdLine(entry.date)}`,
+    `- Arc: ${mdLine(entry.arc)}`,
+    `- Kingdom Turn: ${mdLine(entry.kingdomTurn)}`,
+    `- Updated: ${mdLine(entry.updatedAt)}`,
+    "",
+    "## Summary",
+    mdLine(entry.summary),
+    "",
+    "## Next Prep",
+    mdLine(entry.nextPrep),
+  ].join("\n");
+}
+
+function buildNpcNote(entry) {
+  return [
+    `# ${entry.name || "NPC"}`,
+    "",
+    `- Role: ${mdLine(entry.role)}`,
+    `- Disposition: ${mdLine(entry.disposition)}`,
+    `- Folder: ${mdLine(entry.folder)}`,
+    `- Updated: ${mdLine(entry.updatedAt)}`,
+    "",
+    "## Agenda",
+    mdLine(entry.agenda),
+    "",
+    "## Notes",
+    mdLine(entry.notes),
+  ].join("\n");
+}
+
+function buildQuestNote(entry) {
+  return [
+    `# ${entry.title || "Quest"}`,
+    "",
+    `- Status: ${mdLine(entry.status)}`,
+    `- Giver: ${mdLine(entry.giver)}`,
+    `- Folder: ${mdLine(entry.folder)}`,
+    `- Updated: ${mdLine(entry.updatedAt)}`,
+    "",
+    "## Objective",
+    mdLine(entry.objective),
+    "",
+    "## Stakes",
+    mdLine(entry.stakes),
+  ].join("\n");
+}
+
+function buildLocationNote(entry) {
+  return [
+    `# ${entry.name || "Location"}`,
+    "",
+    `- Hex / Area: ${mdLine(entry.hex)}`,
+    `- Folder: ${mdLine(entry.folder)}`,
+    `- Updated: ${mdLine(entry.updatedAt)}`,
+    "",
+    "## What Changed",
+    mdLine(entry.whatChanged),
+    "",
+    "## Notes",
+    mdLine(entry.notes),
+  ].join("\n");
+}
+
+function buildKingdomNote(entry) {
+  return [
+    `# ${entry.name || "Kingdom Sheet"}`,
+    "",
+    `- Rules Profile: ${mdLine(entry.profileLabel)}`,
+    `- Charter: ${mdLine(entry.charter)}`,
+    `- Government: ${mdLine(entry.government)}`,
+    `- Heartland: ${mdLine(entry.heartland)}`,
+    `- Turn: ${mdLine(entry.currentTurnLabel)}`,
+    `- Date: ${mdLine(entry.currentDate)}`,
+    `- Level: ${mdLine(entry.level)}`,
+    `- Size: ${mdLine(entry.size)}`,
+    `- Control DC: ${mdLine(entry.controlDC)}`,
+    `- Resource Points: ${mdLine(entry.resourcePoints)}`,
+    `- Culture / Economy / Loyalty / Stability: ${entry.culture} / ${entry.economy} / ${entry.loyalty} / ${entry.stability}`,
+    `- Unrest / Fame / Infamy: ${entry.unrest} / ${entry.fame} / ${entry.infamy}`,
+    "",
+    "## Kingdom Notes",
+    mdLine(entry.notes),
+    "",
+    "## Leaders",
+    mdBullets((entry.leaders || []).map((leader) => `${leader.role}: ${leader.name || "Vacant"} (${leader.ability || "No ability"}, +${leader.leadershipBonus || 0})${leader.notes ? ` — ${leader.notes}` : ""}`)),
+    "",
+    "## Settlements",
+    mdBullets((entry.settlements || []).map((settlement) => `${settlement.name} (${settlement.size}) • influence ${settlement.influence} • ${settlement.civicStructure || "No civic structure"}${settlement.notes ? ` — ${settlement.notes}` : ""}`)),
+    "",
+    "## Claimed Regions",
+    mdBullets((entry.regions || []).map((region) => `${region.hex}: ${region.status || "Unknown"}${region.terrain ? ` • ${region.terrain}` : ""}${region.workSite ? ` • ${region.workSite}` : ""}${region.notes ? ` — ${region.notes}` : ""}`)),
+    "",
+    "## Recent Kingdom Turns",
+    mdBullets((entry.turns || []).map((turn) => `${turn.title || "Turn"}${turn.date ? ` (${turn.date})` : ""} • RP ${turn.resourceDelta >= 0 ? "+" : ""}${turn.resourceDelta} • Unrest ${turn.unrestDelta >= 0 ? "+" : ""}${turn.unrestDelta}${turn.summary ? ` — ${turn.summary}` : ""}${turn.notes ? ` | ${turn.notes}` : ""}`)),
+  ].join("\n");
+}
+
+function buildHexMapNote(entry, regions) {
+  return [
+    `# ${entry.mapName || "Hex Map"}`,
+    "",
+    `- Background: ${mdLine(entry.backgroundName)}`,
+    `- Party Position: ${mdLine(entry.party?.hex)}`,
+    `- Party Label: ${mdLine(entry.party?.label)}`,
+    "",
+    "## Party Notes",
+    mdLine(entry.party?.notes),
+    "",
+    "## Party Trail",
+    mdBullets((entry.party?.trail || []).map((point) => `${point.hex}${point.at ? ` • ${point.at}` : ""}`)),
+    "",
+    "## Force Markers",
+    mdBullets((entry.forces || []).map((force) => `${force.name} (${force.type}) at ${force.hex}${force.notes ? ` — ${force.notes}` : ""}`)),
+    "",
+    "## Map Markers",
+    mdBullets((entry.markers || []).map((marker) => `${marker.title} (${marker.type}) at ${marker.hex}${marker.notes ? ` — ${marker.notes}` : ""}`)),
+    "",
+    "## Region Snapshot",
+    mdBullets((regions || []).map((region) => `${region.hex}: ${region.status || "Unknown"}${region.terrain ? ` • ${region.terrain}` : ""}${region.workSite ? ` • ${region.workSite}` : ""}${region.notes ? ` — ${region.notes}` : ""}`)),
+  ].join("\n");
+}
+
+function buildLiveCaptureNote(entries) {
+  return [
+    "# Live Capture",
+    "",
+    mdBullets((entries || []).map((entry) => `${entry.timestamp || "Unknown time"} • ${entry.kind || "Note"}${entry.sessionId ? ` • ${entry.sessionId}` : ""} — ${entry.note || ""}`)),
+  ].join("\n");
+}
+
+function buildCampaignHomeNote(payload, noteRefs) {
+  return [
+    `# ${payload.campaignName || "DM Helper Campaign"}`,
+    "",
+    `- Synced: ${mdLine(payload.generatedAt)}`,
+    `- Sessions: ${(payload.sessions || []).length}`,
+    `- NPCs: ${(payload.npcs || []).length}`,
+    `- Quests: ${(payload.quests || []).length}`,
+    `- Locations: ${(payload.locations || []).length}`,
+    "",
+    "## Quick Links",
+    `- Kingdom Sheet: ${mdWikiLink("Kingdom", noteRefs.kingdom, "Kingdom Sheet")}`,
+    `- Hex Map: ${mdWikiLink("Hex Map", noteRefs.hexMap, "Hex Map")}`,
+    `- Live Capture: ${mdWikiLink(".", noteRefs.liveCapture, "Live Capture")}`,
+    "",
+    "## Sessions",
+    mdBullets(noteRefs.sessions.map((entry) => mdWikiLink("Sessions", entry.noteName, entry.label))),
+    "",
+    "## NPCs",
+    mdBullets(noteRefs.npcs.map((entry) => mdWikiLink("NPCs", entry.noteName, entry.label))),
+    "",
+    "## Quests",
+    mdBullets(noteRefs.quests.map((entry) => mdWikiLink("Quests", entry.noteName, entry.label))),
+    "",
+    "## Locations",
+    mdBullets(noteRefs.locations.map((entry) => mdWikiLink("Locations", entry.noteName, entry.label))),
+  ].join("\n");
+}
+
+async function syncObsidianVault(payload) {
+  const vaultPath = String(payload?.vaultPath || "").trim();
+  if (!vaultPath) {
+    throw new Error("Vault path is required.");
+  }
+  const baseFolderName = sanitizeVaultFileName(payload?.baseFolder || "DM Helper", "DM Helper");
+  const rootFolder = path.join(vaultPath, baseFolderName);
+  const looksLikeVault = await pathExists(path.join(vaultPath, ".obsidian"));
+  await fs.mkdir(rootFolder, { recursive: true });
+  await fs.mkdir(path.join(rootFolder, "Sessions"), { recursive: true });
+  await fs.mkdir(path.join(rootFolder, "NPCs"), { recursive: true });
+  await fs.mkdir(path.join(rootFolder, "Quests"), { recursive: true });
+  await fs.mkdir(path.join(rootFolder, "Locations"), { recursive: true });
+  await fs.mkdir(path.join(rootFolder, "Kingdom"), { recursive: true });
+  await fs.mkdir(path.join(rootFolder, "Hex Map"), { recursive: true });
+
+  const refs = {
+    sessions: [],
+    npcs: [],
+    quests: [],
+    locations: [],
+    kingdom: "Kingdom Sheet",
+    hexMap: "Hex Map",
+    liveCapture: "Live Capture",
+  };
+
+  const usedNames = {
+    sessions: new Set(),
+    npcs: new Set(),
+    quests: new Set(),
+    locations: new Set(),
+  };
+
+  let filesWritten = 0;
+
+  for (const session of Array.isArray(payload?.sessions) ? payload.sessions : []) {
+    const noteName = uniqueVaultNoteName(session?.title || "Session", usedNames.sessions);
+    await writeVaultMarkdownFile(rootFolder, ["Sessions", `${noteName}.md`], buildSessionNote(session));
+    refs.sessions.push({ noteName, label: session?.title || noteName });
+    filesWritten += 1;
+  }
+
+  for (const npc of Array.isArray(payload?.npcs) ? payload.npcs : []) {
+    const noteName = uniqueVaultNoteName(npc?.name || "NPC", usedNames.npcs);
+    await writeVaultMarkdownFile(rootFolder, ["NPCs", `${noteName}.md`], buildNpcNote(npc));
+    refs.npcs.push({ noteName, label: npc?.name || noteName });
+    filesWritten += 1;
+  }
+
+  for (const quest of Array.isArray(payload?.quests) ? payload.quests : []) {
+    const noteName = uniqueVaultNoteName(quest?.title || "Quest", usedNames.quests);
+    await writeVaultMarkdownFile(rootFolder, ["Quests", `${noteName}.md`], buildQuestNote(quest));
+    refs.quests.push({ noteName, label: quest?.title || noteName });
+    filesWritten += 1;
+  }
+
+  for (const location of Array.isArray(payload?.locations) ? payload.locations : []) {
+    const noteName = uniqueVaultNoteName(location?.name || "Location", usedNames.locations);
+    await writeVaultMarkdownFile(rootFolder, ["Locations", `${noteName}.md`], buildLocationNote(location));
+    refs.locations.push({ noteName, label: location?.name || noteName });
+    filesWritten += 1;
+  }
+
+  await writeVaultMarkdownFile(rootFolder, ["Kingdom", `${refs.kingdom}.md`], buildKingdomNote(payload?.kingdom || {}));
+  filesWritten += 1;
+  await writeVaultMarkdownFile(rootFolder, ["Hex Map", `${refs.hexMap}.md`], buildHexMapNote(payload?.hexMap || {}, payload?.kingdom?.regions || []));
+  filesWritten += 1;
+  await writeVaultMarkdownFile(rootFolder, [`${refs.liveCapture}.md`], buildLiveCaptureNote(payload?.liveCapture || []));
+  filesWritten += 1;
+  await writeVaultMarkdownFile(rootFolder, ["Campaign Home.md"], buildCampaignHomeNote(payload || {}, refs));
+  filesWritten += 1;
+
+  return {
+    syncedAt: new Date().toISOString(),
+    rootFolder,
+    filesWritten,
+    looksLikeVault,
+    summary: `Synced ${filesWritten} notes${looksLikeVault ? "" : " (selected folder does not currently contain a .obsidian vault folder)"}`,
+  };
+}
+
+function sanitizeVaultRelativeSegments(value, fallback = []) {
+  const raw = Array.isArray(value) ? value.join("/") : String(value || "");
+  const segments = raw
+    .split(/[\\/]+/)
+    .map((segment) => sanitizeVaultFileName(segment, ""))
+    .filter(Boolean)
+    .slice(0, 8);
+  return segments.length ? segments : Array.isArray(fallback) ? fallback : [sanitizeVaultFileName(fallback, "AI Notes")];
+}
+
+function extractObsidianQueryTerms(value) {
+  const stopWords = new Set([
+    "about",
+    "after",
+    "also",
+    "and",
+    "any",
+    "are",
+    "because",
+    "book",
+    "build",
+    "could",
+    "create",
+    "does",
+    "from",
+    "give",
+    "help",
+    "here",
+    "into",
+    "just",
+    "more",
+    "need",
+    "notes",
+    "only",
+    "party",
+    "players",
+    "quest",
+    "really",
+    "scene",
+    "should",
+    "some",
+    "that",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "vault",
+    "what",
+    "with",
+    "would",
+    "your",
+  ]);
+  const unique = new Set();
+  for (const term of String(value || "").toLowerCase().match(/[a-z0-9][a-z0-9'-]{2,}/g) || []) {
+    if (stopWords.has(term)) continue;
+    unique.add(term);
+    if (unique.size >= 14) break;
+  }
+  return [...unique];
+}
+
+async function collectVaultMarkdownFiles(rootFolder, fileLimit = OBSIDIAN_AI_CONTEXT_FILE_SCAN_LIMIT) {
+  const ignoreDirs = new Set([".obsidian", ".git", ".trash", "node_modules", ".obsidian-trash"]);
+  const pending = [rootFolder];
+  const files = [];
+  while (pending.length && files.length < fileLimit) {
+    const current = pending.pop();
+    let entries = [];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (files.length >= fileLimit) break;
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (ignoreDirs.has(entry.name.toLowerCase())) continue;
+        pending.push(entryPath);
+        continue;
+      }
+      if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".md") continue;
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+function extractObsidianNoteTitle(text, filePath) {
+  const heading = String(text || "").match(/^\s*#\s+(.+?)\s*$/m);
+  if (heading?.[1]) return heading[1].trim();
+  return path.basename(String(filePath || ""), path.extname(String(filePath || ""))) || "Untitled";
+}
+
+function extractRelevantVaultExcerpt(text, queryTerms, charLimit = 420) {
+  const source = String(text || "").replace(/\r\n?/g, "\n").trim();
+  if (!source) return "";
+  const paragraphs = source
+    .split(/\n\s*\n+/)
+    .map((item) => item.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 40);
+  if (!paragraphs.length) return "";
+  if (!Array.isArray(queryTerms) || !queryTerms.length) return paragraphs[0].slice(0, charLimit);
+  const scored = paragraphs
+    .map((paragraph, index) => {
+      const lower = paragraph.toLowerCase();
+      let score = 0;
+      for (const term of queryTerms) {
+        if (lower.includes(term)) score += term.length > 6 ? 3 : 2;
+      }
+      return { paragraph, score, index };
+    })
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index));
+  return (scored[0]?.score > 0 ? scored[0].paragraph : paragraphs[0]).slice(0, charLimit);
+}
+
+function scoreVaultNote({ title, text, terms, modifiedAt }) {
+  const titleLower = String(title || "").toLowerCase();
+  const textLower = String(text || "").toLowerCase();
+  let score = 0;
+  for (const term of Array.isArray(terms) ? terms : []) {
+    if (titleLower.includes(term)) score += 8;
+    if (textLower.includes(term)) score += 3;
+  }
+  const agePenalty = Number.isFinite(modifiedAt) ? Math.max(0, (Date.now() - modifiedAt) / 86400000) : 365;
+  score += Math.max(0, 5 - Math.min(agePenalty, 5));
+  return score;
+}
+
+async function getObsidianVaultContext(payload) {
+  const vaultPath = String(payload?.vaultPath || "").trim();
+  if (!vaultPath) {
+    throw new Error("Vault path is required.");
+  }
+  const baseFolderName = sanitizeVaultFileName(payload?.baseFolder || "DM Helper", "DM Helper");
+  const readWholeVault = payload?.readWholeVault !== false;
+  const maxNotes = Math.max(1, Math.min(12, Number.parseInt(String(payload?.maxNotes || OBSIDIAN_AI_CONTEXT_DEFAULT_NOTE_LIMIT), 10) || OBSIDIAN_AI_CONTEXT_DEFAULT_NOTE_LIMIT));
+  const maxChars = Math.max(800, Math.min(12000, Number.parseInt(String(payload?.maxChars || OBSIDIAN_AI_CONTEXT_DEFAULT_CHAR_LIMIT), 10) || OBSIDIAN_AI_CONTEXT_DEFAULT_CHAR_LIMIT));
+  const sourceRoot = readWholeVault ? vaultPath : path.join(vaultPath, baseFolderName);
+  const sourceExists = await pathExists(sourceRoot);
+  if (!sourceExists) {
+    return {
+      sourceRoot,
+      noteCount: 0,
+      notes: [],
+      summary: "",
+      looksLikeVault: await pathExists(path.join(vaultPath, ".obsidian")),
+    };
+  }
+  const markdownFiles = await collectVaultMarkdownFiles(sourceRoot);
+  const queryTerms = extractObsidianQueryTerms(payload?.query || "");
+  const notes = [];
+  for (const filePath of markdownFiles) {
+    try {
+      const stats = await fs.stat(filePath);
+      const rawText = await fs.readFile(filePath, "utf8");
+      const text = String(rawText || "").replace(/\u0000/g, "").trim();
+      if (!text) continue;
+      const title = extractObsidianNoteTitle(text, filePath);
+      const excerpt = extractRelevantVaultExcerpt(text, queryTerms, 420);
+      notes.push({
+        title,
+        relativePath: path.relative(vaultPath, filePath).replace(/\\/g, "/"),
+        modifiedAt: stats?.mtime ? stats.mtime.toISOString() : "",
+        score: scoreVaultNote({
+          title,
+          text: `${title}\n${text.slice(0, 6000)}`,
+          terms: queryTerms,
+          modifiedAt: Number(stats?.mtimeMs || 0),
+        }),
+        excerpt,
+      });
+    } catch {
+      // Skip unreadable notes.
+    }
+  }
+  const ranked = notes
+    .sort((a, b) => (b.score - a.score) || String(b.modifiedAt || "").localeCompare(String(a.modifiedAt || "")))
+    .slice(0, maxNotes);
+  const summaryLines = [];
+  let usedChars = 0;
+  for (const note of ranked) {
+    const line = `- ${note.title} [${note.relativePath}]${note.excerpt ? `: ${note.excerpt}` : ""}`;
+    if (usedChars + line.length > maxChars && summaryLines.length) break;
+    summaryLines.push(line.slice(0, Math.max(120, maxChars - usedChars)));
+    usedChars += line.length + 1;
+    if (usedChars >= maxChars) break;
+  }
+  return {
+    sourceRoot,
+    noteCount: notes.length,
+    notes: ranked.map(({ title, relativePath, modifiedAt, excerpt }) => ({
+      title,
+      relativePath,
+      modifiedAt,
+      excerpt,
+    })),
+    summary: summaryLines.join("\n"),
+    looksLikeVault: await pathExists(path.join(vaultPath, ".obsidian")),
+  };
+}
+
+function buildObsidianAiNoteMarkdown(payload) {
+  const title = sanitizeVaultFileName(payload?.title || "AI Note", "AI Note");
+  const generatedAt = String(payload?.generatedAt || new Date().toISOString()).trim();
+  const sourceTab = String(payload?.sourceTab || "").trim();
+  const model = String(payload?.model || "").trim();
+  const prompt = mdText(payload?.prompt || "");
+  const content = mdText(payload?.content || "");
+  return [
+    `# ${title}`,
+    "",
+    `- Generated: ${mdLine(generatedAt)}`,
+    `- Source Tab: ${mdLine(sourceTab)}`,
+    `- Model: ${mdLine(model)}`,
+    "",
+    "## Prompt",
+    mdLine(prompt),
+    "",
+    "## AI Output",
+    mdLine(content),
+  ].join("\n");
+}
+
+async function writeObsidianAiNote(payload) {
+  const vaultPath = String(payload?.vaultPath || "").trim();
+  if (!vaultPath) {
+    throw new Error("Vault path is required.");
+  }
+  const content = mdText(payload?.content || "");
+  if (!content) {
+    throw new Error("AI output is empty.");
+  }
+  const baseFolderName = sanitizeVaultFileName(payload?.baseFolder || "DM Helper", "DM Helper");
+  const rootFolder = path.join(vaultPath, baseFolderName);
+  const noteFolderSegments = sanitizeVaultRelativeSegments(payload?.noteFolder, ["AI Notes"]);
+  const noteName = sanitizeVaultFileName(payload?.title || "AI Note", "AI Note");
+  await fs.mkdir(path.join(rootFolder, ...noteFolderSegments), { recursive: true });
+  const relativeSegments = [...noteFolderSegments, `${noteName}.md`];
+  const targetPath = await writeVaultMarkdownFile(rootFolder, relativeSegments, buildObsidianAiNoteMarkdown(payload));
+  return {
+    rootFolder,
+    targetPath,
+    relativePath: path.relative(vaultPath, targetPath).replace(/\\/g, "/"),
+    writtenAt: new Date().toISOString(),
+    summary: `Wrote AI note to ${path.relative(rootFolder, targetPath).replace(/\\/g, "/")}.`,
+  };
 }
 
 function sanitizeEmbeddingVector(rawVector) {
@@ -460,6 +1311,57 @@ function registerIpc() {
     return DEFAULT_PDF_FOLDER;
   });
 
+  ipcMain.handle("obsidian:pick-vault", async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Choose Obsidian Vault",
+      properties: ["openDirectory"],
+      defaultPath: app.getPath("documents"),
+    });
+    if (result.canceled || !result.filePaths?.length) return null;
+    const selectedPath = result.filePaths[0];
+    return {
+      path: selectedPath,
+      looksLikeVault: await pathExists(path.join(selectedPath, ".obsidian")),
+    };
+  });
+
+  ipcMain.handle("obsidian:sync", async (_event, payload) => {
+    return syncObsidianVault(payload || {});
+  });
+
+  ipcMain.handle("obsidian:get-context", async (_event, payload) => {
+    return getObsidianVaultContext(payload || {});
+  });
+
+  ipcMain.handle("obsidian:write-ai-note", async (_event, payload) => {
+    return writeObsidianAiNote(payload || {});
+  });
+
+  ipcMain.handle("aon:search-rules", async (_event, payload) => {
+    const query = String(payload?.query || "").trim();
+    const limitRaw = Number.parseInt(String(payload?.limit || "4"), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, AON_RULES_MAX_MATCHES)) : 4;
+    return searchAonRules(query, limit, { force: payload?.force === true });
+  });
+
+  ipcMain.handle("map:pick-background", async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Choose Hex Map Background",
+      properties: ["openFile"],
+      filters: [
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] },
+      ],
+      defaultPath: DEFAULT_PDF_FOLDER,
+    });
+    if (result.canceled || !result.filePaths?.length) return null;
+    const selectedPath = result.filePaths[0];
+    return {
+      path: selectedPath,
+      fileUrl: pathToFileURL(selectedPath).href,
+      name: path.basename(selectedPath),
+    };
+  });
+
   ipcMain.handle("pdf:get-index-summary", async () => {
     return buildPdfIndexSummary();
   });
@@ -694,6 +1596,13 @@ function registerIpc() {
     return true;
   });
 
+  ipcMain.handle("system:open-external", async (_event, targetUrl) => {
+    const url = String(targetUrl || "").trim();
+    if (!url) return false;
+    await shell.openExternal(url);
+    return true;
+  });
+
   ipcMain.handle("system:open-path-at-page", async (_event, payload) => {
     const targetPath = String(payload?.targetPath || "").trim();
     if (!targetPath) return false;
@@ -749,7 +1658,24 @@ function registerIpc() {
       pdfSnippets: [],
       pdfIndexedFiles: getIndexedPdfFileNames(config.compactContext ? 20 : 40),
       pdfIndexedFileCount: pdfIndexCache.files.length,
+      aonRulesEnabled: false,
+      aonRulesMatches: Array.isArray(context?.aonRulesMatches) ? context.aonRulesMatches : [],
     };
+    if (
+      config.useAonRules &&
+      String(context?.taskType || "").trim() === "rules_question" &&
+      !enrichedContext.aonRulesMatches.length
+    ) {
+      try {
+        const aonResults = await searchAonRules(input, config.compactContext ? 3 : 4);
+        enrichedContext.aonRulesMatches = Array.isArray(aonResults?.results) ? aonResults.results : [];
+        enrichedContext.aonRulesEnabled = enrichedContext.aonRulesMatches.length > 0;
+      } catch {
+        enrichedContext.aonRulesEnabled = false;
+      }
+    } else {
+      enrichedContext.aonRulesEnabled = enrichedContext.aonRulesMatches.length > 0;
+    }
     if (config.usePdfContext && pdfIndexCache.files.length) {
       const query = [
         input,
@@ -1714,6 +2640,7 @@ function normalizeAiConfig(rawConfig) {
   const tempRaw = Number.parseFloat(String(rawConfig?.temperature ?? "0.2"));
   const temperature = Number.isFinite(tempRaw) ? Math.max(0, Math.min(tempRaw, 2)) : 0.2;
   const usePdfContext = rawConfig?.usePdfContext === false ? false : true;
+  const useAonRules = rawConfig?.useAonRules === false ? false : true;
   const compactContext = rawConfig?.compactContext === false ? false : true;
   const maxOutputTokensRaw = Number.parseInt(String(rawConfig?.maxOutputTokens ?? "320"), 10);
   const maxOutputTokens = Number.isFinite(maxOutputTokensRaw)
@@ -1729,6 +2656,7 @@ function normalizeAiConfig(rawConfig) {
     model,
     temperature,
     usePdfContext,
+    useAonRules,
     compactContext,
     maxOutputTokens,
     timeoutSec,
@@ -1995,12 +2923,40 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
   const npcs = Array.isArray(context?.npcs) ? context.npcs : [];
   const locations = Array.isArray(context?.locations) ? context.locations : [];
   const kingdom = context?.kingdom || null;
+  const aiMemory = context?.aiMemory || {};
   const selectedPdfFile = summarizeForPrompt(String(context?.selectedPdfFile || ""), 120);
   const selectedPdfSummary = summarizeForPrompt(String(context?.selectedPdfSummary || ""), compactContext ? 720 : 1100);
   const selectedPdfPreview = summarizeForPrompt(String(context?.selectedPdfPreview || ""), compactContext ? 720 : 1100);
   const indexedPdfFiles = Array.isArray(context?.pdfIndexedFiles) ? context.pdfIndexedFiles : [];
   const pdfSummaryBriefs = Array.isArray(context?.pdfSummaryBriefs) ? context.pdfSummaryBriefs : [];
   const indexedPdfCount = Number.parseInt(String(context?.pdfIndexedFileCount || indexedPdfFiles.length || 0), 10) || 0;
+  const retrievalSummary = context?.retrievalSummary && typeof context.retrievalSummary === "object" ? context.retrievalSummary : {};
+  const retrievedChunks = Array.isArray(context?.retrievedChunks) ? context.retrievedChunks : [];
+  const aonRulesMatches = Array.isArray(context?.aonRulesMatches) ? context.aonRulesMatches : [];
+  const aonRulesEnabled = context?.aonRulesEnabled === true;
+  const campaignMemorySummary = summarizeForPrompt(String(aiMemory?.campaignSummary || ""), compactContext ? 700 : 1100);
+  const recentSessionMemory = summarizeForPrompt(String(aiMemory?.recentSessionSummary || ""), compactContext ? 700 : 1100);
+  const activeQuestMemory = summarizeForPrompt(String(aiMemory?.activeQuestsSummary || ""), compactContext ? 700 : 1100);
+  const activeEntityMemory = summarizeForPrompt(String(aiMemory?.activeEntitiesSummary || ""), compactContext ? 600 : 900);
+  const canonMemory = summarizeForPrompt(String(aiMemory?.canonSummary || ""), compactContext ? 700 : 1100);
+  const rulingsDigest = summarizeForPrompt(String(aiMemory?.rulingsDigest || ""), compactContext ? 600 : 900);
+  const obsidianContext = summarizeForPrompt(String(context?.obsidianContext || ""), compactContext ? 1400 : 2200);
+  const obsidianVaultNotes = Array.isArray(context?.obsidianVaultNotes) ? context.obsidianVaultNotes : [];
+  const obsidianContextEnabled = context?.obsidianContextEnabled === true;
+  const obsidianContextNoteCount = Number.parseInt(String(context?.obsidianContextNoteCount || obsidianVaultNotes.length || 0), 10) || 0;
+  const retrievalQuery = summarizeForPrompt(String(retrievalSummary?.query || ""), compactContext ? 180 : 320);
+  const retrievalSourceSummary = retrievalSummary?.sourceCounts && typeof retrievalSummary.sourceCounts === "object"
+    ? Object.entries(retrievalSummary.sourceCounts)
+        .filter((entry) => Number(entry[1] || 0) > 0)
+        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])))
+        .map(([key, value]) => `${key} ${value}`)
+        .join("; ")
+    : "";
+  const taskType = summarizeForPrompt(String(context?.taskType || ""), 48);
+  const taskLabel = summarizeForPrompt(String(context?.taskLabel || ""), 80);
+  const taskSaveTarget = summarizeForPrompt(String(context?.taskSaveTarget || ""), 120);
+  const routeReason = summarizeForPrompt(String(context?.routeReason || ""), 180);
+  const entityType = summarizeForPrompt(String(context?.entityType || ""), 40);
   const aiHistory = Array.isArray(context?.aiHistory) ? context.aiHistory : [];
   const activeTab = summarizeForPrompt(String(context?.activeTab || ""), 40);
   const tabLabel = summarizeForPrompt(String(context?.tabLabel || ""), 80);
@@ -2050,6 +3006,10 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
     summarizeForPrompt(input, limits.draft),
     "",
     "Campaign context:",
+    `Task class: ${taskType || "unspecified"}${taskLabel ? ` (${taskLabel})` : ""}`,
+    `Task save target: ${taskSaveTarget || "unspecified"}`,
+    ...(routeReason ? [`Routing reason: ${routeReason}`] : []),
+    ...(entityType ? [`Target entity type: ${entityType}`] : []),
     `Active tab: ${activeTab || "unknown"} (${tabLabel || "unknown"})`,
     `Tab context: ${tabContext || "None provided."}`,
     `Latest session: ${summarizeForPrompt(String(latestSession?.title || ""), 120)} | ${summarizeForPrompt(
@@ -2062,15 +3022,43 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
     ...(trackedNpcLines.length ? ["Tracked NPC records:", ...trackedNpcLines] : ["Tracked NPC records: None listed."]),
     ...(trackedLocationLines.length ? ["Tracked location records:", ...trackedLocationLines] : ["Tracked location records: None listed."]),
     ...(kingdomLines.length ? ["Kingdom records:", ...kingdomLines] : []),
+    ...(campaignMemorySummary || recentSessionMemory || activeQuestMemory || activeEntityMemory || canonMemory || rulingsDigest
+      ? [
+          "Memory digests:",
+          ...(campaignMemorySummary ? [`Campaign summary: ${campaignMemorySummary}`] : []),
+          ...(recentSessionMemory ? [`Recent session summary: ${recentSessionMemory}`] : []),
+          ...(activeQuestMemory ? [`Active quests digest: ${activeQuestMemory}`] : []),
+          ...(activeEntityMemory ? [`Active entities digest: ${activeEntityMemory}`] : []),
+          ...(canonMemory ? [`Canon memory digest: ${canonMemory}`] : []),
+          ...(rulingsDigest ? [`Rulings / house rules digest: ${rulingsDigest}`] : []),
+        ]
+      : []),
+    `Unified retrieval chunks: ${retrievedChunks.length}`,
+    ...(retrievalQuery ? [`Retrieval query: ${retrievalQuery}`] : []),
+    ...(retrievalSourceSummary ? [`Retrieval sources: ${retrievalSourceSummary}`] : []),
+    `Archives of Nethys rules lookup enabled: ${aonRulesEnabled ? "yes" : "no"}`,
     `PDF context enabled: ${pdfEnabled ? "yes" : "no"}`,
     `Indexed PDF files (${indexedPdfCount}): ${
       indexedPdfFiles.length
         ? indexedPdfFiles.map((name) => summarizeForPrompt(String(name || ""), 70)).join("; ")
         : "None indexed."
     }`,
+    `Obsidian vault context enabled: ${obsidianContextEnabled ? "yes" : "no"}`,
     `Selected PDF focus: ${selectedPdfFile || "None selected."}`,
     ...(selectedPdfSummary ? [`Selected PDF summary: ${selectedPdfSummary}`] : []),
     ...(selectedPdfPreview ? [`Selected PDF preview: ${selectedPdfPreview}`] : []),
+    ...(obsidianContext ? [`Obsidian vault context (${obsidianContextNoteCount} note${obsidianContextNoteCount === 1 ? "" : "s"}): ${obsidianContext}`] : []),
+    ...(obsidianVaultNotes.length
+      ? [
+          "Top vault notes:",
+          ...obsidianVaultNotes.map(
+            (note, index) =>
+              `${index + 1}. ${summarizeForPrompt(String(note?.title || "Note"), 80)} [${
+                summarizeForPrompt(String(note?.relativePath || ""), 100)
+              }] ${summarizeForPrompt(String(note?.excerpt || ""), limits.snippet)}`
+          ),
+        ]
+      : []),
     ...(pdfSummaryBriefs.length
       ? [
           "Saved PDF memory briefs:",
@@ -2083,6 +3071,30 @@ function buildAiUserPrompt({ mode, input, context, compactContext = true }) {
           ),
         ]
       : ["Saved PDF memory briefs: None yet."]),
+    ...(aonRulesMatches.length
+      ? [
+          "Archives of Nethys rule matches:",
+          ...aonRulesMatches.map(
+            (entry, index) =>
+              `${index + 1}. ${summarizeForPrompt(String(entry?.title || "Rule"), 90)} [${summarizeForPrompt(
+                String(entry?.url || ""),
+                140
+              )}] ${summarizeForPrompt(String(entry?.snippet || ""), limits.snippet * 2)}`
+          ),
+        ]
+      : []),
+    ...(retrievedChunks.length
+      ? [
+          "Retrieved context chunks:",
+          ...retrievedChunks.map(
+            (chunk, index) =>
+              `${index + 1}. [${summarizeForPrompt(String(chunk?.sourceLabel || chunk?.sourceType || "context"), 40)}] ${summarizeForPrompt(
+                String(chunk?.title || "untitled"),
+                80
+              )}: ${summarizeForPrompt(String(chunk?.text || ""), limits.snippet * 2)}`
+          ),
+        ]
+      : ["Retrieved context chunks: None selected."]),
     "",
     ...(historyTurns.length
       ? [

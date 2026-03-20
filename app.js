@@ -19,16 +19,26 @@ const AI_MODEL_LABELS = Object.freeze({
   "qwen2.5-coder:32b": "Qwen 2.5 Coder (32B)",
 });
 
+const RULE_STORE_KIND_LABELS = Object.freeze({
+  official_note: "Official Note",
+  accepted_ruling: "Accepted Ruling",
+  house_rule: "House Rule",
+  canon_memory: "Canon Memory",
+});
+
 const tabs = [
   { id: "dashboard", label: "Dashboard", group: "Run Game" },
   { id: "sessions", label: "Session Runner", group: "Run Game" },
   { id: "capture", label: "Live Capture HUD", group: "Run Game" },
   { id: "writing", label: "Writing Helper", group: "Run Game" },
   { id: "kingdom", label: "Kingdom", group: "World" },
+  { id: "hexmap", label: "Hex Map", group: "World" },
   { id: "npcs", label: "NPCs", group: "World" },
   { id: "quests", label: "Quests", group: "World" },
   { id: "locations", label: "Locations", group: "World" },
+  { id: "rules", label: "PF2e Rules", group: "Tools" },
   { id: "pdf", label: "PDF Intel", group: "Tools" },
+  { id: "obsidian", label: "Obsidian Vault", group: "Tools" },
   { id: "foundry", label: "Foundry Export", group: "Tools" },
 ];
 
@@ -38,7 +48,7 @@ const desktopApi = window.kmDesktop || null;
 const kingdomRulesData = await loadKingdomRulesData();
 
 let activeTab = "dashboard";
-let state = loadState();
+let state = null;
 const ui = {
   pdfBusy: false,
   pdfMessage: "",
@@ -50,6 +60,14 @@ const ui = {
   pdfSummaryProgressCurrent: 0,
   pdfSummaryProgressTotal: 0,
   pdfSummaryProgressLabel: "",
+  rulesBusy: false,
+  rulesMessage: "",
+  rulesSearchQuery: "",
+  rulesSearchLimit: 5,
+  rulesScope: "both",
+  rulesResults: [],
+  rulesSelectedUrl: "",
+  rulesIndexedAt: "",
   sessionMessage: "",
   kingdomMessage: "",
   customChecklistDraft: "",
@@ -68,6 +86,7 @@ const ui = {
   copilotOpen: false,
   copilotShowOutput: false,
   copilotPendingFallbackMemory: null,
+  copilotRetrievalPreview: null,
   copilotDraft: {
     input: "",
     output: "",
@@ -92,6 +111,10 @@ const ui = {
     quests: "",
     locations: "",
   },
+  obsidianMessage: "",
+  obsidianBusy: false,
+  hexMapMessage: "",
+  hexMapSelectedHex: "",
   wizardOpen: false,
   wizardDraft: {
     sessionId: "",
@@ -111,7 +134,12 @@ const ui = {
     output: "",
     autoLink: true,
   },
+  dashboardMessage: "",
+  startupError: "",
 };
+let hexMapPointerState = null;
+let hexMapSuppressClickUntil = 0;
+let hexMapViewportSaveTimer = 0;
 
 const tabsEl = document.getElementById("tabs");
 const appEl = document.getElementById("app");
@@ -120,10 +148,68 @@ const exportBtn = document.getElementById("export-btn");
 const importBtn = document.getElementById("import-btn");
 const importFile = document.getElementById("import-file");
 
-render();
-wireGlobalEvents();
-void initDesktopDefaults();
+window.addEventListener("error", (event) => {
+  handleStartupFailure(event?.error || event?.message || "Unknown renderer error.");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  handleStartupFailure(event?.reason || "Unhandled promise rejection.");
+});
+
+queueMicrotask(() => {
+  bootApp();
+});
 // Avoid startup lockups: only auto-run after an explicit tab change.
+
+function bootApp() {
+  try {
+    state = loadState();
+    state.meta.aiMemory = buildAiMemoryDigests(state);
+    wireGlobalEvents();
+    render();
+    void initDesktopDefaults();
+  } catch (err) {
+    handleStartupFailure(err);
+  }
+}
+
+function handleStartupFailure(err) {
+  const message = readableError(err);
+  if (ui.startupError === message) return;
+  ui.startupError = message;
+  console.error("DM Helper startup failed:", err);
+  try {
+    state = createStarterState();
+    render();
+    renderStartupRecoveryBanner(message);
+  } catch (fallbackErr) {
+    console.error("DM Helper startup fallback failed:", fallbackErr);
+    tabsEl.innerHTML = "";
+    appEl.innerHTML = `
+      <section class="panel fatal-panel">
+        <h2>Startup Error</h2>
+        <p>DM Helper could not finish loading.</p>
+        <pre>${escapeHtml(message)}</pre>
+        <p>Close the app and send this error text back here.</p>
+      </section>
+    `;
+  }
+}
+
+function renderStartupRecoveryBanner(message) {
+  const summary = escapeHtml(message);
+  const warning = `
+    <section class="panel startup-warning">
+      <h2>Recovery Mode</h2>
+      <p>Saved app state failed to load. DM Helper started with safe starter data for this launch.</p>
+      <details>
+        <summary>Startup error details</summary>
+        <pre>${summary}</pre>
+      </details>
+    </section>
+  `;
+  appEl.innerHTML = `${warning}${appEl.innerHTML}`;
+}
 
 async function initDesktopDefaults() {
   if (!desktopApi) return;
@@ -190,6 +276,30 @@ function wireGlobalEvents() {
       void maybeAutoRunCopilotOnTabChange("tab-switch");
     }
   });
+
+  appEl.addEventListener("pointerdown", (event) => {
+    handleHexMapPointerDown(event);
+  });
+
+  window.addEventListener("pointermove", (event) => {
+    handleHexMapPointerMove(event);
+  });
+
+  window.addEventListener("pointerup", () => {
+    finishHexMapPointerSession();
+  });
+
+  window.addEventListener("pointercancel", () => {
+    finishHexMapPointerSession();
+  });
+
+  appEl.addEventListener(
+    "wheel",
+    (event) => {
+      handleHexMapWheel(event);
+    },
+    { passive: false }
+  );
 
   seedBtn.addEventListener("click", () => {
     if (!confirm("Replace current in-app data with starter campaign data?")) return;
@@ -260,6 +370,10 @@ function wireGlobalEvents() {
       quests: "",
       locations: "",
     };
+    ui.obsidianMessage = "";
+    ui.obsidianBusy = false;
+    ui.hexMapMessage = "";
+    ui.hexMapSelectedHex = "";
     render();
   });
 
@@ -326,6 +440,10 @@ function wireGlobalEvents() {
         quests: "",
         locations: "",
       };
+      ui.obsidianMessage = "";
+      ui.obsidianBusy = false;
+      ui.hexMapMessage = "";
+      ui.hexMapSelectedHex = "";
       render();
     } catch (err) {
       alert(`Import failed: ${String(err)}`);
@@ -362,6 +480,274 @@ function wireGlobalEvents() {
 
     if (action === "world-add-folder" && collection) {
       addWorldFolderFromDraft(collection);
+      return;
+    }
+
+    if (action === "hexmap-select-hex") {
+      if (Date.now() < hexMapSuppressClickUntil) return;
+      const targetHex = normalizeHexCoordinate(button.dataset.hex);
+      if (!targetHex) return;
+      const hexMap = getHexMapState();
+      if (hexMap.partyMoveMode) {
+        const party = moveHexMapPartyToHex(targetHex);
+        setHexMapSelectedHex(targetHex);
+        saveState();
+        ui.hexMapMessage = `${party.label || "Party"} moved to ${targetHex}.`;
+        render();
+        return;
+      }
+      setHexMapSelectedHex(targetHex);
+      render();
+      return;
+    }
+
+    if (action === "hexmap-toggle-party-move") {
+      const hexMap = getHexMapState();
+      hexMap.partyMoveMode = !hexMap.partyMoveMode;
+      state.hexMap = normalizeHexMapState(hexMap);
+      saveState();
+      ui.hexMapMessage = hexMap.partyMoveMode
+        ? "Party move mode is on. Click any hex on the map to move the party there."
+        : "Party move mode is off. Clicking the map selects hexes again.";
+      render();
+      return;
+    }
+
+    if (action === "hexmap-zoom-in" || action === "hexmap-zoom-out") {
+      const hexMap = getHexMapState();
+      const factor = action === "hexmap-zoom-in" ? 1.15 : 0.87;
+      hexMap.zoom = Math.max(HEX_MAP_ZOOM_MIN, Math.min(HEX_MAP_ZOOM_MAX, Number((hexMap.zoom * factor).toFixed(2))));
+      clampHexMapPan(hexMap);
+      saveState();
+      render();
+      return;
+    }
+
+    if (action === "hexmap-reset-view") {
+      const hexMap = getHexMapState();
+      hexMap.zoom = 1;
+      hexMap.panX = 0;
+      hexMap.panY = 0;
+      saveState();
+      render();
+      return;
+    }
+
+    if (action === "hexmap-pan") {
+      const hexMap = getHexMapState();
+      const view = getHexMapViewBox(hexMap);
+      const stepX = Math.max(30, view.width * 0.18);
+      const stepY = Math.max(30, view.height * 0.18);
+      const direction = str(button.dataset.direction).toLowerCase();
+      if (direction === "left") hexMap.panX -= stepX;
+      if (direction === "right") hexMap.panX += stepX;
+      if (direction === "up") hexMap.panY -= stepY;
+      if (direction === "down") hexMap.panY += stepY;
+      clampHexMapPan(hexMap);
+      saveState();
+      render();
+      return;
+    }
+
+    if (action === "hexmap-clear-region") {
+      const selectedHex = getHexMapSelectedHex();
+      if (!selectedHex) return;
+      if (!confirm(`Clear the region record for ${selectedHex}?`)) return;
+      const removed = clearHexMapRegion(selectedHex);
+      saveState();
+      ui.hexMapMessage = removed ? `Cleared region record for ${selectedHex}.` : `No region record existed for ${selectedHex}.`;
+      render();
+      return;
+    }
+
+    if (action === "hexmap-choose-background") {
+      void chooseHexMapBackground();
+      return;
+    }
+
+    if (action === "hexmap-clear-background") {
+      const hexMap = getHexMapState();
+      hexMap.backgroundPath = "";
+      hexMap.backgroundUrl = "";
+      hexMap.backgroundName = "";
+      hexMap.backgroundNaturalWidth = 0;
+      hexMap.backgroundNaturalHeight = 0;
+      hexMap.backgroundScale = 1;
+      hexMap.backgroundOffsetX = 0;
+      hexMap.backgroundOffsetY = 0;
+      saveState();
+      ui.hexMapMessage = "Map background cleared.";
+      render();
+      return;
+    }
+
+    if (action === "hexmap-fit-background") {
+      const hexMap = getHexMapState();
+      if (!hexMap.backgroundUrl) return;
+      hexMap.backgroundScale = 1;
+      hexMap.backgroundOffsetX = 0;
+      hexMap.backgroundOffsetY = 0;
+      saveState();
+      ui.hexMapMessage = "Background recentered. Fine-tune with scale and offset if needed.";
+      render();
+      return;
+    }
+
+    if (action === "hexmap-clear-party") {
+      const hexMap = getHexMapState();
+      hexMap.party = {
+        hex: "",
+        label: str(hexMap.party?.label) || "Party",
+        notes: "",
+        updatedAt: new Date().toISOString(),
+        trail: [],
+      };
+      state.hexMap = normalizeHexMapState(hexMap);
+      saveState();
+      ui.hexMapMessage = "Party marker cleared.";
+      render();
+      return;
+    }
+
+    if (action === "hexmap-center-party") {
+      const hexMap = getHexMapState();
+      const party = getHexMapParty(hexMap);
+      if (!party.hex) return;
+      setHexMapSelectedHex(party.hex);
+      centerHexMapOnHex(party.hex, hexMap);
+      saveState();
+      render();
+      return;
+    }
+
+    if (action === "hexmap-clear-party-trail") {
+      const hexMap = getHexMapState();
+      const party = getHexMapParty(hexMap);
+      hexMap.party = {
+        ...party,
+        trail: party.hex
+          ? [
+              {
+                hex: party.hex,
+                at: new Date().toISOString(),
+              },
+            ]
+          : [],
+      };
+      state.hexMap = normalizeHexMapState(hexMap);
+      saveState();
+      ui.hexMapMessage = "Party travel history cleared.";
+      render();
+      return;
+    }
+
+    if (action === "obsidian-choose-vault") {
+      void chooseObsidianVault();
+      return;
+    }
+
+    if (action === "obsidian-open-vault") {
+      const settings = ensureObsidianSettings();
+      if (!settings.vaultPath || !desktopApi?.openPath) return;
+      void desktopApi.openPath(settings.vaultPath);
+      return;
+    }
+
+    if (action === "obsidian-sync") {
+      void syncObsidianVault();
+      return;
+    }
+
+    if (action === "ai-memory-refresh") {
+      refreshAiMemoryDigests({ persist: true });
+      return;
+    }
+
+    if (action === "obsidian-write-current-ai" || action === "ai-copilot-write-vault") {
+      void writeCurrentAiOutputToObsidian();
+      return;
+    }
+
+    if (action === "rules-refresh-search") {
+      void runRulesSearch(ui.rulesSearchQuery, ui.rulesSearchLimit, true);
+      return;
+    }
+
+    if (action === "rules-select-result") {
+      const url = decodeURIComponent(str(button.dataset.url));
+      ui.rulesSelectedUrl = url;
+      render();
+      return;
+    }
+
+    if (action === "rules-open-result") {
+      const url = decodeURIComponent(str(button.dataset.url));
+      if (url && desktopApi?.openExternal) {
+        void desktopApi.openExternal(url);
+      }
+      return;
+    }
+
+    if (action === "rules-save-result") {
+      const url = decodeURIComponent(str(button.dataset.url));
+      if (url) ui.rulesSelectedUrl = url;
+      saveSelectedOfficialRuleToStore();
+      return;
+    }
+
+    if (action === "rules-open-store-source") {
+      const url = decodeURIComponent(str(button.dataset.url));
+      if (url && desktopApi?.openExternal) {
+        void desktopApi.openExternal(url);
+      }
+      return;
+    }
+
+    if (action === "rules-delete-store-entry") {
+      const id = decodeURIComponent(str(button.dataset.id));
+      if (deleteRulesStoreEntry(id)) {
+        state.meta.aiMemory = buildAiMemoryDigests(state);
+        saveState();
+        ui.rulesMessage = "Local rules/canon entry removed.";
+      }
+      render();
+      return;
+    }
+
+    if (action === "rules-use-result" || action === "rules-compare-result") {
+      const url = decodeURIComponent(str(button.dataset.url));
+      if (url) ui.rulesSelectedUrl = url;
+      const selected = getSelectedRulesResult(ui.rulesResults);
+      ui.copilotOpen = true;
+      ui.copilotDraft.input = selected
+        ? buildRulesPromptFromResult(selected, action === "rules-compare-result" ? "compare" : "explain")
+        : buildRulesQuestionPrompt(ui.rulesSearchQuery || "");
+      ui.copilotDraft.output = "";
+      ui.copilotRetrievalPreview = null;
+      ui.copilotMessage = action === "rules-compare-result"
+        ? "Loaded official-vs-local PF2e rules prompt."
+        : "Loaded official PF2e rules prompt.";
+      render();
+      return;
+    }
+
+    if (action === "rules-use-query") {
+      ui.copilotOpen = true;
+      ui.copilotDraft.input = buildRulesQuestionPrompt(ui.rulesSearchQuery || "");
+      ui.copilotDraft.output = "";
+      ui.copilotRetrievalPreview = null;
+      ui.copilotMessage = "Loaded the current PF2e rules query into Loremaster.";
+      render();
+      return;
+    }
+
+    if (action === "ai-copilot-save-ruling") {
+      saveCopilotOutputToRulesStore("accepted_ruling");
+      return;
+    }
+
+    if (action === "ai-copilot-save-canon") {
+      saveCopilotOutputToRulesStore("canon_memory");
       return;
     }
 
@@ -406,6 +792,42 @@ function wireGlobalEvents() {
 
     if (action === "session-wizard-cancel") {
       closeSessionCloseWizard();
+      return;
+    }
+
+    if (action === "kingdom-recalculate-creation") {
+      const form = button.closest("form");
+      if (!(form instanceof HTMLFormElement)) return;
+      const fields = getFormFields(form);
+      const nextLevel = Math.max(1, Number.parseInt(String(fields.level || getKingdomState().level || "1"), 10) || 1);
+      if (
+        nextLevel > 1 &&
+        !confirm("This resets the kingdom's ability modifiers and trained-skill baseline to the creation package. Continue?")
+      ) {
+        return;
+      }
+      const plan = recalculateKingdomFromCreationChoices(fields);
+      saveState();
+      ui.kingdomMessage = `Recalculated creation package: ${Object.entries(plan.abilityAdjustments)
+        .map(([key, value]) => `${KINGDOM_ABILITY_LABELS[key]} ${formatSignedNumber(value)}`)
+        .join(", ")}.`;
+      render();
+      return;
+    }
+
+    if (action === "kingdom-use-creation-choice") {
+      const form = appEl.querySelector('form[data-form="kingdom-overview"]');
+      if (!(form instanceof HTMLFormElement)) return;
+      const section = str(button.dataset.section);
+      const value = str(button.dataset.value);
+      const fieldName =
+        section === "charters" ? "charter" : section === "governments" ? "government" : section === "heartlands" ? "heartland" : "";
+      if (!fieldName) return;
+      const field = form.elements.namedItem(fieldName);
+      if (field instanceof HTMLSelectElement || field instanceof HTMLInputElement) {
+        field.value = value;
+      }
+      syncKingdomCreationPreview(form);
       return;
     }
 
@@ -622,6 +1044,7 @@ function wireGlobalEvents() {
         input: "",
         output: "",
       };
+      ui.copilotRetrievalPreview = null;
       ui.copilotMessage = "";
       ui.aiLastError = "";
       ui.aiLastErrorAt = "";
@@ -667,6 +1090,7 @@ function wireGlobalEvents() {
         return;
       }
       ui.copilotDraft.input = str(turn.text);
+      ui.copilotRetrievalPreview = null;
       ui.copilotMessage = `Loaded ${turn.role === "assistant" ? "AI" : "your"} message into the prompt.`;
       render();
       return;
@@ -708,6 +1132,7 @@ function wireGlobalEvents() {
 
     if (action === "ai-copilot-seed") {
       ui.copilotDraft.input = buildGlobalCopilotSeedPrompt(activeTab);
+      ui.copilotRetrievalPreview = null;
       ui.copilotMessage = "Loaded a tab-specific prompt template.";
       render();
       return;
@@ -802,6 +1227,17 @@ function wireGlobalEvents() {
       return;
     }
 
+    const rulesForm = input.closest('form[data-form="rules-search"]');
+    if (rulesForm instanceof HTMLFormElement) {
+      if (input.getAttribute("name") === "query") ui.rulesSearchQuery = normalizeRulesSearchQuery(input.value);
+      if (input.getAttribute("name") === "limit") ui.rulesSearchLimit = Math.max(1, Math.min(6, Number.parseInt(String(input.value || "5"), 10) || 5));
+      if (input.getAttribute("name") === "scope") {
+        ui.rulesScope = ["both", "official", "local"].includes(str(input.value)) ? str(input.value) : "both";
+        render();
+      }
+      return;
+    }
+
     const checkId = input.dataset.checkId;
     if (checkId) {
       const checks = ensureChecklistChecks();
@@ -864,6 +1300,9 @@ function wireGlobalEvents() {
     const copilotField = input.dataset.copilotField;
     if (copilotField && ui.copilotDraft && copilotField in ui.copilotDraft) {
       ui.copilotDraft[copilotField] = input.value;
+      if (copilotField === "input") {
+        ui.copilotRetrievalPreview = null;
+      }
       return;
     }
 
@@ -921,6 +1360,12 @@ function wireGlobalEvents() {
       return;
     }
 
+    const kingdomForm = input.closest('form[data-form="kingdom-overview"]');
+    if (kingdomForm instanceof HTMLFormElement) {
+      syncKingdomCreationPreview(kingdomForm);
+      return;
+    }
+
     const collection = input.dataset.collection;
     const id = input.dataset.id;
     const field = input.dataset.field;
@@ -930,6 +1375,30 @@ function wireGlobalEvents() {
       if (folderName) addWorldFolder(collection, folderName);
     }
     patchEntity(collection, id, { [field]: input.value });
+  });
+
+  appEl.addEventListener("input", (event) => {
+    const input = event.target;
+    if (
+      !(
+        input instanceof HTMLInputElement ||
+        input instanceof HTMLTextAreaElement ||
+        input instanceof HTMLSelectElement
+      )
+    )
+      return;
+
+    const kingdomForm = input.closest('form[data-form="kingdom-overview"]');
+    if (kingdomForm instanceof HTMLFormElement) {
+      syncKingdomCreationPreview(kingdomForm);
+    }
+
+    const rulesForm = input.closest('form[data-form="rules-search"]');
+    if (rulesForm instanceof HTMLFormElement) {
+      if (input.getAttribute("name") === "query") {
+        ui.rulesSearchQuery = normalizeRulesSearchQuery(input.value);
+      }
+    }
   });
 }
 
@@ -942,10 +1411,13 @@ function render() {
   if (activeTab === "capture") content = renderCaptureHUD();
   if (activeTab === "writing") content = renderWritingHelper();
   if (activeTab === "kingdom") content = renderKingdom();
+  if (activeTab === "hexmap") content = renderHexMap();
   if (activeTab === "npcs") content = renderNpcs();
   if (activeTab === "quests") content = renderQuests();
   if (activeTab === "locations") content = renderLocations();
+  if (activeTab === "rules") content = renderRules();
   if (activeTab === "pdf") content = renderPdfIntel();
+  if (activeTab === "obsidian") content = renderObsidian();
   if (activeTab === "foundry") content = renderFoundry();
 
   appEl.innerHTML = `${content}${renderGlobalAiCopilot()}`;
@@ -978,7 +1450,9 @@ function renderTabLinks() {
 
 function renderGlobalAiCopilot() {
   const aiConfig = ensureAiConfig();
+  const obsidianSettings = ensureObsidianSettings();
   const tabLabel = getTabLabel(activeTab);
+  const routePreview = buildGlobalCopilotRequest(activeTab, ui.copilotDraft.input, false);
   const memoryTurns = getRecentAiHistory(activeTab, 16);
   const chatTurns = buildVisibleCopilotChatTurns(memoryTurns, ui.copilotDraft.output, ui.copilotBusy);
   const canSaveFallbackToMemory = !!ui.copilotPendingFallbackMemory?.text;
@@ -1018,12 +1492,18 @@ function renderGlobalAiCopilot() {
             ui.copilotDraft.input || ""
           )}</textarea>
         </label>
+        <p class="small">Route: <strong>${escapeHtml(routePreview.taskLabel || "General Prep")}</strong> • Mode ${escapeHtml(
+          routePreview.mode || getGlobalCopilotMode(activeTab)
+        )} • Save target ${escapeHtml(routePreview.saveTarget || "latest session prep")}${routePreview.routeReason ? ` • ${escapeHtml(routePreview.routeReason)}` : ""}</p>
         <div class="toolbar">
           <button class="btn btn-primary" data-action="ai-copilot-generate">Generate</button>
           <button class="btn btn-secondary" data-action="ai-copilot-seed">Smart Prompt</button>
           <button class="btn btn-secondary" data-action="ai-copilot-test" ${aiBusy ? "disabled" : ""}>${testLabel}</button>
           <button class="btn btn-secondary" data-action="ai-copilot-unlock">Unlock</button>
           <button class="btn btn-secondary" data-action="ai-copilot-copy" ${hasOutput ? "" : "disabled"}>Copy</button>
+          <button class="btn btn-secondary" data-action="ai-copilot-write-vault" ${(hasOutput && obsidianSettings.vaultPath && !ui.obsidianBusy) ? "" : "disabled"}>Write To Vault</button>
+          <button class="btn btn-secondary" data-action="ai-copilot-save-ruling" ${hasOutput ? "" : "disabled"}>Save As Ruling</button>
+          <button class="btn btn-secondary" data-action="ai-copilot-save-canon" ${hasOutput ? "" : "disabled"}>Save As Canon</button>
           <button class="btn btn-primary" data-action="ai-copilot-apply" ${hasOutput ? "" : "disabled"}>${escapeHtml(
             getGlobalCopilotApplyLabel(activeTab)
           )}</button>
@@ -1080,6 +1560,10 @@ function renderGlobalAiCopilot() {
             <input type="checkbox" data-ai-field="usePdfContext" ${aiConfig.usePdfContext ? "checked" : ""} />
             Use indexed PDF context in AI responses
           </label>
+          <label style="margin-top:8px;">
+            <input type="checkbox" data-ai-field="useAonRules" ${aiConfig.useAonRules ? "checked" : ""} />
+            Use Archives of Nethys live lookup for PF2e rules questions
+          </label>
         </details>
         <details class="copilot-settings">
           <summary>Conversation Memory (${memoryTurns.length})</summary>
@@ -1097,6 +1581,7 @@ function renderGlobalAiCopilot() {
               : `<p class="small">No saved conversation yet.</p>`
           }
         </details>
+        ${renderCopilotRetrievalPreview(ui.copilotRetrievalPreview)}
         ${message ? `<p class="small copilot-status-line"${messageTitleAttr}>${escapeHtml(message)}</p>` : ""}
         ${aiTestStatus}
         ${renderAiTroubleshootingPanel()}
@@ -1192,6 +1677,58 @@ function renderAiHistoryTurn(turn) {
   `;
 }
 
+function renderCopilotRetrievalPreview(preview) {
+  if (!preview || typeof preview !== "object") {
+    return `
+      <details class="copilot-settings">
+        <summary>Retrieved Context (0)</summary>
+        <p class="small">No retrieval run yet for the current prompt.</p>
+      </details>
+    `;
+  }
+
+  const chunks = Array.isArray(preview.chunks) ? preview.chunks : [];
+  const sourceCounts = preview.sourceCounts && typeof preview.sourceCounts === "object" ? preview.sourceCounts : {};
+  const sourceSummary = Object.entries(sourceCounts)
+    .filter((entry) => Number(entry[1] || 0) > 0)
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])))
+    .map(([key, value]) => `${key} ${value}`)
+    .join(" • ");
+
+  return `
+    <details class="copilot-settings">
+      <summary>Retrieved Context (${chunks.length})</summary>
+      <p class="small">
+        Query: ${escapeHtml(str(preview.query || "none"))}
+        ${preview.taskLabel ? ` • Task ${escapeHtml(str(preview.taskLabel))}` : ""}
+        ${preview.generatedAt ? ` • Built ${escapeHtml(str(preview.generatedAt))}` : ""}
+      </p>
+      <p class="small">
+        ${escapeHtml(sourceSummary || "No source chunks selected.")}
+      </p>
+      ${
+        chunks.length
+          ? `<div class="ai-history-list">${chunks
+              .map(
+                (chunk) => `
+                  <article class="panel" style="margin-top:8px;">
+                    <strong>${escapeHtml(str(chunk.title || "Untitled chunk"))}</strong>
+                    <p class="small">${escapeHtml(
+                      [str(chunk.sourceLabel || chunk.sourceType), chunk.reason, chunk.score ? `score ${chunk.score}` : ""]
+                        .filter(Boolean)
+                        .join(" • ")
+                    )}</p>
+                    <div class="memory-block">${renderMultilineText(str(chunk.text || "No excerpt."))}</div>
+                  </article>
+                `
+              )
+              .join("")}</div>`
+          : `<p class="small">No retrieval chunks were selected for the last run.</p>`
+      }
+    </details>
+  `;
+}
+
 function formatAiHistoryTimestamp(value) {
   const time = safeDate(value);
   if (!Number.isFinite(time)) return "";
@@ -1207,7 +1744,22 @@ function renderPageIntro(title, description) {
   `;
 }
 
+function renderMultilineText(text) {
+  return escapeHtml(str(text)).replace(/\n/g, "<br />");
+}
+
+function renderAiMemoryCard(title, text) {
+  return `
+    <article class="memory-card">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="memory-block">${renderMultilineText(text || "None yet.")}</div>
+    </article>
+  `;
+}
+
 function renderDashboard() {
+  const aiMemory = buildAiMemoryDigests(state);
+  state.meta.aiMemory = aiMemory;
   const openQuests = state.quests.filter((q) => q.status !== "completed" && q.status !== "failed");
   const recentSessions = [...state.sessions]
     .sort((a, b) => safeDate(b.date) - safeDate(a.date))
@@ -1228,6 +1780,47 @@ function renderDashboard() {
         <article class="panel stat">
           <span class="small">Tracked NPCs</span>
           <span class="stat-value">${state.npcs.length}</span>
+        </article>
+      </section>
+
+      <section class="grid grid-2">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>AI Memory Layer</h2>
+            <div class="toolbar">
+              <button class="btn btn-secondary" data-action="ai-memory-refresh">Refresh Memory</button>
+            </div>
+          </div>
+          <p class="small">Last updated ${escapeHtml(aiMemory.updatedAt || "never")} • sources: ${escapeHtml(
+            `sessions ${aiMemory.sourceCounts.sessions}, open quests ${aiMemory.sourceCounts.openQuests}, NPCs ${aiMemory.sourceCounts.npcs}, locations ${aiMemory.sourceCounts.locations}, rule entries ${aiMemory.sourceCounts.ruleEntries}, canon ${aiMemory.sourceCounts.canonEntries}`
+          )}</p>
+          ${ui.dashboardMessage ? `<p class="small">${escapeHtml(ui.dashboardMessage)}</p>` : ""}
+          <div class="memory-grid">
+            ${renderAiMemoryCard("Campaign Summary", aiMemory.campaignSummary)}
+            ${renderAiMemoryCard("Recent Session Summary", aiMemory.recentSessionSummary)}
+            ${renderAiMemoryCard("Active Quests", aiMemory.activeQuestsSummary)}
+            ${renderAiMemoryCard("Active Entities", aiMemory.activeEntitiesSummary)}
+            ${renderAiMemoryCard("Canon Memory", aiMemory.canonSummary)}
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>Rulings / House Rules Digest</h2>
+          <p class="small">This is the authoritative manual digest Loremaster should prefer when a PF2e ruling or house-rule question comes up. If left blank, DM Helper falls back to recent Rule / Retcon capture entries.</p>
+          <form data-form="ai-memory-rulings">
+            <label>Manual Rulings Digest
+              <textarea name="manualRulings" placeholder="Example: Hero Point rerolls must be declared before any new info is revealed. Persistent damage from house-rule fire traps ticks at end of round, not end of turn.">${escapeHtml(
+                aiMemory.manualRulings || ""
+              )}</textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Save Rulings Digest</button>
+            </div>
+          </form>
+          <div class="memory-card">
+            <h3>Effective Rulings Digest</h3>
+            <div class="memory-block">${renderMultilineText(aiMemory.rulingsDigest || "No rulings digest captured yet.")}</div>
+          </div>
         </article>
       </section>
 
@@ -1689,6 +2282,10 @@ function renderWritingHelper() {
             <label style="margin-top:8px;">
               <input type="checkbox" data-ai-field="usePdfContext" ${aiConfig.usePdfContext ? "checked" : ""} />
               Use indexed PDF context in AI responses
+            </label>
+            <label style="margin-top:8px;">
+              <input type="checkbox" data-ai-field="useAonRules" ${aiConfig.useAonRules ? "checked" : ""} />
+              Use Archives of Nethys live lookup for PF2e rules questions
             </label>
             <div class="toolbar">
               <button class="btn btn-secondary" data-action="writing-test-ai">${testLabel}</button>
@@ -2233,6 +2830,923 @@ function getActiveKingdomProfile() {
   return getKingdomProfileById(state?.kingdom?.profileId || getDefaultKingdomProfileId());
 }
 
+const KINGDOM_SKILL_DEFINITIONS = [
+  { name: "Agriculture", ability: "economy" },
+  { name: "Arts", ability: "culture" },
+  { name: "Boating", ability: "economy" },
+  { name: "Defense", ability: "stability" },
+  { name: "Engineering", ability: "stability" },
+  { name: "Exploration", ability: "stability" },
+  { name: "Folklore", ability: "culture" },
+  { name: "Industry", ability: "economy" },
+  { name: "Intrigue", ability: "loyalty" },
+  { name: "Magic", ability: "culture" },
+  { name: "Politics", ability: "loyalty" },
+  { name: "Scholarship", ability: "culture" },
+  { name: "Statecraft", ability: "loyalty" },
+  { name: "Trade", ability: "economy" },
+  { name: "Warfare", ability: "loyalty" },
+  { name: "Wilderness", ability: "stability" }
+];
+
+const KINGDOM_ABILITY_KEYS = ["culture", "economy", "loyalty", "stability"];
+const KINGDOM_ABILITY_LABELS = {
+  culture: "Culture",
+  economy: "Economy",
+  loyalty: "Loyalty",
+  stability: "Stability"
+};
+const KINGDOM_SKILL_RANKS = ["untrained", "trained", "expert", "master", "legendary"];
+const KINGDOM_SKILL_RANK_LABELS = {
+  untrained: "Untrained",
+  trained: "Trained",
+  expert: "Expert",
+  master: "Master",
+  legendary: "Legendary"
+};
+const KINGDOM_SETTLEMENT_ACTIONS = {
+  "Town Hall": 1,
+  Castle: 2,
+  Palace: 2
+};
+const HEX_MAP_MARKER_TYPES = ["Encounter", "Building", "Event", "Settlement", "Resource", "Danger", "Note"];
+const HEX_MAP_FORCE_TYPES = ["Allied Force", "Enemy Force", "Caravan"];
+const HEX_MAP_STATUS_OPTIONS = ["Unclaimed", "Reconnoitered", "Claimed", "Work Site", "Settlement", "Contested"];
+const HEX_MAP_TERRAIN_OPTIONS = ["Plains", "Forest", "Hills", "Mountains", "Marsh", "River", "Lake", "Ruins", "Road", "Settlement"];
+const HEX_MAP_HEX_SIZE_MIN = 30;
+const HEX_MAP_HEX_SIZE_MAX = 110;
+const HEX_MAP_COLUMNS_MIN = 6;
+const HEX_MAP_COLUMNS_MAX = 20;
+const HEX_MAP_ROWS_MIN = 4;
+const HEX_MAP_ROWS_MAX = 16;
+const HEX_MAP_ZOOM_MIN = 0.7;
+const HEX_MAP_ZOOM_MAX = 6;
+const HEX_MAP_BACKGROUND_SCALE_MIN = 0.4;
+const HEX_MAP_BACKGROUND_SCALE_MAX = 3.5;
+
+function canonicalizeKingdomSkillName(value) {
+  const clean = str(value).trim().toLowerCase();
+  if (!clean) return "";
+  return KINGDOM_SKILL_DEFINITIONS.find((entry) => entry.name.toLowerCase() === clean)?.name || "";
+}
+
+function canonicalizeKingdomAbilityName(value) {
+  const clean = str(value).trim().toLowerCase();
+  return KINGDOM_ABILITY_KEYS.find((entry) => entry === clean) || "";
+}
+
+function getKingdomSkillDefinition(skillName) {
+  const clean = canonicalizeKingdomSkillName(skillName);
+  return KINGDOM_SKILL_DEFINITIONS.find((entry) => entry.name === clean) || null;
+}
+
+function getKingdomSkillRank(rank) {
+  const clean = str(rank).trim().toLowerCase();
+  return KINGDOM_SKILL_RANKS.includes(clean) ? clean : "untrained";
+}
+
+function getKingdomSkillRankWeight(rank) {
+  return KINGDOM_SKILL_RANKS.indexOf(getKingdomSkillRank(rank));
+}
+
+function parseSkillList(value, canonical = false) {
+  const parts = str(value)
+    .split(",")
+    .map((entry) => str(entry).trim())
+    .filter(Boolean);
+  if (!canonical) return [...new Set(parts)];
+  const normalized = parts.map((entry) => canonicalizeKingdomSkillName(entry)).filter(Boolean);
+  return [...new Set(normalized)];
+}
+
+function parseCommaList(value) {
+  return str(value)
+    .split(",")
+    .map((entry) => str(entry).trim())
+    .filter(Boolean);
+}
+
+function parseAbilityList(value) {
+  return parseCommaList(value).map((entry) => canonicalizeKingdomAbilityName(entry)).filter(Boolean);
+}
+
+function createStarterKingdomCreationState() {
+  return {
+    freeAbilityBoosts: [],
+    charterSkill: "",
+    heartlandSkill: "",
+    bonusSkills: []
+  };
+}
+
+function normalizeKingdomCreationState(input) {
+  const base = createStarterKingdomCreationState();
+  const out = {
+    ...base,
+    ...(input && typeof input === "object" && !Array.isArray(input) ? input : {})
+  };
+  out.freeAbilityBoosts = parseAbilityList(Array.isArray(out.freeAbilityBoosts) ? out.freeAbilityBoosts.join(", ") : out.freeAbilityBoosts);
+  out.charterSkill = canonicalizeKingdomSkillName(out.charterSkill);
+  out.heartlandSkill = canonicalizeKingdomSkillName(out.heartlandSkill);
+  out.bonusSkills = parseSkillList(Array.isArray(out.bonusSkills) ? out.bonusSkills.join(", ") : out.bonusSkills, true).slice(0, 8);
+  return out;
+}
+
+function createStarterHexMapState() {
+  return {
+    mapName: "Stolen Lands Hex Planner",
+    columns: 10,
+    rows: 8,
+    hexSize: 54,
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    showLabels: true,
+    backgroundPath: "",
+    backgroundUrl: "",
+    backgroundName: "",
+    backgroundNaturalWidth: 0,
+    backgroundNaturalHeight: 0,
+    backgroundOpacity: 0.5,
+    backgroundScale: 1,
+    backgroundOffsetX: 0,
+    backgroundOffsetY: 0,
+    gridFillOpacity: 0.16,
+    gridLineOpacity: 0.65,
+    partyMoveMode: false,
+    party: {
+      hex: "",
+      label: "Party",
+      notes: "",
+      updatedAt: "",
+      trail: [],
+    },
+    forces: [],
+    markers: [],
+  };
+}
+
+function normalizeHexMapState(input) {
+  const base = createStarterHexMapState();
+  const out = {
+    ...base,
+    ...(input && typeof input === "object" && !Array.isArray(input) ? input : {}),
+  };
+  out.mapName = str(out.mapName) || base.mapName;
+  out.columns = Math.max(HEX_MAP_COLUMNS_MIN, Math.min(HEX_MAP_COLUMNS_MAX, Number.parseInt(String(out.columns || base.columns), 10) || base.columns));
+  out.rows = Math.max(HEX_MAP_ROWS_MIN, Math.min(HEX_MAP_ROWS_MAX, Number.parseInt(String(out.rows || base.rows), 10) || base.rows));
+  out.hexSize = Math.max(HEX_MAP_HEX_SIZE_MIN, Math.min(HEX_MAP_HEX_SIZE_MAX, Number.parseInt(String(out.hexSize || base.hexSize), 10) || base.hexSize));
+  out.zoom = Math.max(HEX_MAP_ZOOM_MIN, Math.min(HEX_MAP_ZOOM_MAX, Number.parseFloat(String(out.zoom || base.zoom)) || base.zoom));
+  out.panX = Number.isFinite(Number.parseFloat(String(out.panX))) ? Number.parseFloat(String(out.panX)) : 0;
+  out.panY = Number.isFinite(Number.parseFloat(String(out.panY))) ? Number.parseFloat(String(out.panY)) : 0;
+  out.showLabels = out.showLabels !== false;
+  out.backgroundPath = str(out.backgroundPath);
+  out.backgroundUrl = str(out.backgroundUrl);
+  out.backgroundName = str(out.backgroundName);
+  out.backgroundNaturalWidth = Math.max(0, Number.parseFloat(String(out.backgroundNaturalWidth || "0")) || 0);
+  out.backgroundNaturalHeight = Math.max(0, Number.parseFloat(String(out.backgroundNaturalHeight || "0")) || 0);
+  out.backgroundOpacity = Math.max(0, Math.min(0.95, Number.parseFloat(String(out.backgroundOpacity ?? base.backgroundOpacity)) || base.backgroundOpacity));
+  out.backgroundScale = Math.max(
+    HEX_MAP_BACKGROUND_SCALE_MIN,
+    Math.min(HEX_MAP_BACKGROUND_SCALE_MAX, Number.parseFloat(String(out.backgroundScale ?? base.backgroundScale)) || base.backgroundScale)
+  );
+  out.backgroundOffsetX = Number.isFinite(Number.parseFloat(String(out.backgroundOffsetX)))
+    ? Number.parseFloat(String(out.backgroundOffsetX))
+    : 0;
+  out.backgroundOffsetY = Number.isFinite(Number.parseFloat(String(out.backgroundOffsetY)))
+    ? Number.parseFloat(String(out.backgroundOffsetY))
+    : 0;
+  out.gridFillOpacity = Math.max(0, Math.min(0.65, Number.parseFloat(String(out.gridFillOpacity ?? base.gridFillOpacity)) || base.gridFillOpacity));
+  out.gridLineOpacity = Math.max(0.15, Math.min(1, Number.parseFloat(String(out.gridLineOpacity ?? base.gridLineOpacity)) || base.gridLineOpacity));
+  out.partyMoveMode = out.partyMoveMode === true;
+  const rawParty = out.party && typeof out.party === "object" && !Array.isArray(out.party) ? out.party : {};
+  out.party = {
+    hex: normalizeHexCoordinate(rawParty.hex, out.columns, out.rows) || "",
+    label: str(rawParty.label) || "Party",
+    notes: str(rawParty.notes),
+    updatedAt: str(rawParty.updatedAt) || "",
+    trail: Array.isArray(rawParty.trail)
+      ? rawParty.trail
+          .map((entry) => ({
+            hex: normalizeHexCoordinate(entry?.hex, out.columns, out.rows),
+            at: str(entry?.at) || "",
+          }))
+          .filter((entry) => entry.hex)
+          .slice(0, 30)
+      : [],
+  };
+  out.forces = Array.isArray(out.forces)
+    ? out.forces
+        .map((force) => ({
+          id: str(force?.id) || uid(),
+          hex: normalizeHexCoordinate(force?.hex, out.columns, out.rows),
+          type: HEX_MAP_FORCE_TYPES.includes(str(force?.type)) ? str(force?.type) : "Allied Force",
+          name: str(force?.name) || "Unnamed force",
+          notes: str(force?.notes),
+          updatedAt: str(force?.updatedAt) || "",
+        }))
+        .filter((force) => force.hex)
+    : [];
+  out.markers = Array.isArray(out.markers)
+    ? out.markers
+        .map((marker) => ({
+          id: str(marker?.id) || uid(),
+          hex: normalizeHexCoordinate(marker?.hex),
+          type: HEX_MAP_MARKER_TYPES.includes(str(marker?.type)) ? str(marker?.type) : "Note",
+          title: str(marker?.title),
+          notes: str(marker?.notes),
+          updatedAt: str(marker?.updatedAt) || "",
+        }))
+        .filter((marker) => marker.hex)
+    : [];
+  return out;
+}
+
+function getHexMapState() {
+  if (!state.hexMap || typeof state.hexMap !== "object" || Array.isArray(state.hexMap)) {
+    state.hexMap = createStarterHexMapState();
+  } else {
+    state.hexMap = normalizeHexMapState(state.hexMap);
+  }
+  return state.hexMap;
+}
+
+function getHexColumnLabel(index) {
+  let value = Math.max(0, Number.parseInt(String(index || "0"), 10) || 0) + 1;
+  let label = "";
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    label = String.fromCharCode(65 + remainder) + label;
+    value = Math.floor((value - 1) / 26);
+  }
+  return label || "A";
+}
+
+function getHexColumnIndex(label) {
+  const clean = String(label || "").trim().toUpperCase();
+  if (!/^[A-Z]+$/.test(clean)) return -1;
+  let total = 0;
+  for (const char of clean) {
+    total = total * 26 + (char.charCodeAt(0) - 64);
+  }
+  return total - 1;
+}
+
+function parseHexCoordinate(value) {
+  const clean = String(value || "").trim().toUpperCase().replace(/\s+/g, "");
+  const match = clean.match(/^([A-Z]+)[-:]?(\d{1,2})$/);
+  if (!match) return null;
+  return {
+    columnLabel: match[1],
+    columnIndex: getHexColumnIndex(match[1]),
+    rowIndex: Math.max(0, Number.parseInt(match[2], 10) - 1),
+  };
+}
+
+function normalizeHexCoordinate(value, columns = 0, rows = 0) {
+  const parsed = parseHexCoordinate(value);
+  if (!parsed || parsed.columnIndex < 0 || parsed.rowIndex < 0) return "";
+  if (columns && parsed.columnIndex >= columns) return "";
+  if (rows && parsed.rowIndex >= rows) return "";
+  return `${getHexColumnLabel(parsed.columnIndex)}${parsed.rowIndex + 1}`;
+}
+
+function getHexMapMetrics(hexMap) {
+  const size = Math.max(HEX_MAP_HEX_SIZE_MIN, Math.min(HEX_MAP_HEX_SIZE_MAX, Number.parseInt(String(hexMap?.hexSize || 54), 10) || 54));
+  const hexWidth = size * 2;
+  const hexHeight = Math.sqrt(3) * size;
+  const stepX = size * 1.5;
+  const margin = size * 1.6;
+  const columns = Math.max(HEX_MAP_COLUMNS_MIN, Number.parseInt(String(hexMap?.columns || "10"), 10) || 10);
+  const rows = Math.max(HEX_MAP_ROWS_MIN, Number.parseInt(String(hexMap?.rows || "8"), 10) || 8);
+  const boardWidth = margin * 2 + hexWidth + Math.max(0, columns - 1) * stepX;
+  const boardHeight = margin * 2 + rows * hexHeight + hexHeight / 2;
+  return {
+    size,
+    hexWidth,
+    hexHeight,
+    stepX,
+    margin,
+    columns,
+    rows,
+    boardWidth,
+    boardHeight,
+  };
+}
+
+function getHexCenter(columnIndex, rowIndex, hexMap) {
+  const metrics = getHexMapMetrics(hexMap);
+  return {
+    cx: metrics.margin + metrics.size + columnIndex * metrics.stepX,
+    cy: metrics.margin + metrics.hexHeight / 2 + rowIndex * metrics.hexHeight + (columnIndex % 2 ? metrics.hexHeight / 2 : 0),
+  };
+}
+
+function buildHexPolygonPoints(cx, cy, size) {
+  const points = [];
+  for (let i = 0; i < 6; i += 1) {
+    const angle = (Math.PI / 180) * (60 * i);
+    const x = cx + size * Math.cos(angle);
+    const y = cy + size * Math.sin(angle);
+    points.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+  }
+  return points.join(" ");
+}
+
+function clampHexMapPan(hexMap) {
+  const metrics = getHexMapMetrics(hexMap);
+  const zoom = Math.max(HEX_MAP_ZOOM_MIN, Math.min(HEX_MAP_ZOOM_MAX, Number(hexMap.zoom || 1)));
+  const viewWidth = metrics.boardWidth / zoom;
+  const viewHeight = metrics.boardHeight / zoom;
+  const maxX = Math.max(0, metrics.boardWidth - viewWidth);
+  const maxY = Math.max(0, metrics.boardHeight - viewHeight);
+  hexMap.panX = Math.max(0, Math.min(maxX, Number(hexMap.panX || 0)));
+  hexMap.panY = Math.max(0, Math.min(maxY, Number(hexMap.panY || 0)));
+}
+
+function getHexMapViewBox(hexMap) {
+  clampHexMapPan(hexMap);
+  const metrics = getHexMapMetrics(hexMap);
+  const zoom = Math.max(HEX_MAP_ZOOM_MIN, Math.min(HEX_MAP_ZOOM_MAX, Number(hexMap.zoom || 1)));
+  return {
+    x: Number(hexMap.panX || 0),
+    y: Number(hexMap.panY || 0),
+    width: metrics.boardWidth / zoom,
+    height: metrics.boardHeight / zoom,
+    ...metrics,
+  };
+}
+
+function syncHexMapViewportDom() {
+  const stage = document.querySelector(".hexmap-stage");
+  if (!(stage instanceof SVGElement)) return;
+  const hexMap = getHexMapState();
+  const view = getHexMapViewBox(hexMap);
+  stage.setAttribute(
+    "viewBox",
+    `${view.x.toFixed(2)} ${view.y.toFixed(2)} ${view.width.toFixed(2)} ${view.height.toFixed(2)}`
+  );
+  const zoomChip = document.querySelector("[data-hexmap-zoom-chip]");
+  if (zoomChip) zoomChip.textContent = `Zoom ${Math.round(hexMap.zoom * 100)}%`;
+}
+
+function scheduleHexMapViewportSave() {
+  if (hexMapViewportSaveTimer) window.clearTimeout(hexMapViewportSaveTimer);
+  hexMapViewportSaveTimer = window.setTimeout(() => {
+    hexMapViewportSaveTimer = 0;
+    saveState();
+  }, 180);
+}
+
+function handleHexMapPointerDown(event) {
+  if (!(event.target instanceof Element)) return;
+  const stageShell = event.target.closest("[data-hexmap-stage-shell]");
+  if (!(stageShell instanceof HTMLElement)) return;
+  if (activeTab !== "hexmap") return;
+  if (event.button !== 0) return;
+  const hexMap = getHexMapState();
+  const view = getHexMapViewBox(hexMap);
+  const rect = stageShell.getBoundingClientRect();
+  hexMapPointerState = {
+    shell: stageShell,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startPanX: Number(hexMap.panX || 0),
+    startPanY: Number(hexMap.panY || 0),
+    viewWidth: view.width,
+    viewHeight: view.height,
+    rectWidth: rect.width,
+    rectHeight: rect.height,
+    didDrag: false,
+  };
+  stageShell.classList.add("is-dragging");
+  event.preventDefault();
+}
+
+function handleHexMapPointerMove(event) {
+  if (!hexMapPointerState) return;
+  const hexMap = getHexMapState();
+  const deltaClientX = event.clientX - hexMapPointerState.startClientX;
+  const deltaClientY = event.clientY - hexMapPointerState.startClientY;
+  if (Math.abs(deltaClientX) > 4 || Math.abs(deltaClientY) > 4) {
+    hexMapPointerState.didDrag = true;
+  }
+  const boardDeltaX = deltaClientX * (hexMapPointerState.viewWidth / Math.max(1, hexMapPointerState.rectWidth));
+  const boardDeltaY = deltaClientY * (hexMapPointerState.viewHeight / Math.max(1, hexMapPointerState.rectHeight));
+  hexMap.panX = hexMapPointerState.startPanX - boardDeltaX;
+  hexMap.panY = hexMapPointerState.startPanY - boardDeltaY;
+  clampHexMapPan(hexMap);
+  syncHexMapViewportDom();
+}
+
+function finishHexMapPointerSession() {
+  if (!hexMapPointerState) return;
+  const didDrag = hexMapPointerState.didDrag;
+  hexMapPointerState.shell?.classList.remove("is-dragging");
+  hexMapPointerState = null;
+  if (didDrag) {
+    hexMapSuppressClickUntil = Date.now() + 180;
+    saveState();
+  }
+}
+
+function handleHexMapWheel(event) {
+  if (!(event.target instanceof Element)) return;
+  const stageShell = event.target.closest("[data-hexmap-stage-shell]");
+  if (!(stageShell instanceof HTMLElement)) return;
+  if (activeTab !== "hexmap") return;
+  event.preventDefault();
+  const hexMap = getHexMapState();
+  const metrics = getHexMapMetrics(hexMap);
+  const rect = stageShell.getBoundingClientRect();
+  const oldView = getHexMapViewBox(hexMap);
+  const offsetX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+  const offsetY = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
+  const anchorX = oldView.x + (offsetX / Math.max(1, rect.width)) * oldView.width;
+  const anchorY = oldView.y + (offsetY / Math.max(1, rect.height)) * oldView.height;
+  const factor = event.deltaY < 0 ? 1.12 : 0.89;
+  const nextZoom = Math.max(HEX_MAP_ZOOM_MIN, Math.min(HEX_MAP_ZOOM_MAX, Number((hexMap.zoom * factor).toFixed(2))));
+  if (nextZoom === hexMap.zoom) return;
+  hexMap.zoom = nextZoom;
+  const nextViewWidth = metrics.boardWidth / nextZoom;
+  const nextViewHeight = metrics.boardHeight / nextZoom;
+  hexMap.panX = anchorX - (offsetX / Math.max(1, rect.width)) * nextViewWidth;
+  hexMap.panY = anchorY - (offsetY / Math.max(1, rect.height)) * nextViewHeight;
+  clampHexMapPan(hexMap);
+  syncHexMapViewportDom();
+  scheduleHexMapViewportSave();
+}
+
+function getHexMapBackgroundPlacement(hexMap) {
+  const metrics = getHexMapMetrics(hexMap);
+  const naturalWidth = Math.max(1, Number.parseFloat(String(hexMap?.backgroundNaturalWidth || "0")) || metrics.boardWidth);
+  const naturalHeight = Math.max(1, Number.parseFloat(String(hexMap?.backgroundNaturalHeight || "0")) || metrics.boardHeight);
+  const fitScale = Math.min(metrics.boardWidth / naturalWidth, metrics.boardHeight / naturalHeight);
+  const manualScale = Math.max(
+    HEX_MAP_BACKGROUND_SCALE_MIN,
+    Math.min(HEX_MAP_BACKGROUND_SCALE_MAX, Number.parseFloat(String(hexMap?.backgroundScale || "1")) || 1)
+  );
+  const width = naturalWidth * fitScale * manualScale;
+  const height = naturalHeight * fitScale * manualScale;
+  const offsetX = Number.parseFloat(String(hexMap?.backgroundOffsetX || "0")) || 0;
+  const offsetY = Number.parseFloat(String(hexMap?.backgroundOffsetY || "0")) || 0;
+  return {
+    x: (metrics.boardWidth - width) / 2 + offsetX,
+    y: (metrics.boardHeight - height) / 2 + offsetY,
+    width,
+    height,
+    naturalWidth,
+    naturalHeight,
+    fitScale,
+  };
+}
+
+function getHexStatusColor(status) {
+  const clean = str(status).toLowerCase();
+  if (clean === "claimed") return "#4d8f74";
+  if (clean === "reconnoitered") return "#d5c187";
+  if (clean === "work site") return "#9b6f45";
+  if (clean === "settlement") return "#2f7a63";
+  if (clean === "contested") return "#b25b47";
+  return "#f2ead8";
+}
+
+function getHexMarkerColor(type) {
+  const clean = str(type).toLowerCase();
+  if (clean === "encounter") return "#8a3c2a";
+  if (clean === "building") return "#8f6a3d";
+  if (clean === "event") return "#9c7b25";
+  if (clean === "settlement") return "#2f7a63";
+  if (clean === "resource") return "#336d91";
+  if (clean === "danger") return "#6d2432";
+  return "#6d5a42";
+}
+
+function getHexForceColor(type) {
+  const clean = str(type).toLowerCase();
+  if (clean === "enemy force") return "#8a2f2f";
+  if (clean === "caravan") return "#a06a22";
+  return "#2f7a63";
+}
+
+function getHexForceGlyph(type) {
+  const clean = str(type).toLowerCase();
+  if (clean === "enemy force") return "E";
+  if (clean === "caravan") return "C";
+  return "A";
+}
+
+function getHexMapSelectedHex(hexMap = getHexMapState()) {
+  const kingdom = getKingdomState();
+  const candidates = [
+    ui.hexMapSelectedHex,
+    ...(kingdom.regions || []).map((region) => region.hex),
+    ...(hexMap.markers || []).map((marker) => marker.hex),
+    "A1",
+  ];
+  const chosen = candidates
+    .map((value) => normalizeHexCoordinate(value, hexMap.columns, hexMap.rows))
+    .find(Boolean);
+  ui.hexMapSelectedHex = chosen || "A1";
+  return ui.hexMapSelectedHex;
+}
+
+function setHexMapSelectedHex(value) {
+  const hexMap = getHexMapState();
+  ui.hexMapSelectedHex = normalizeHexCoordinate(value, hexMap.columns, hexMap.rows) || getHexMapSelectedHex(hexMap);
+}
+
+function getKingdomRegionByHex(hex) {
+  const clean = normalizeHexCoordinate(hex);
+  if (!clean) return null;
+  return getKingdomState().regions.find((region) => normalizeHexCoordinate(region.hex) === clean) || null;
+}
+
+function getHexMapMarkersForHex(hex) {
+  const clean = normalizeHexCoordinate(hex);
+  if (!clean) return [];
+  return getHexMapState().markers.filter((marker) => normalizeHexCoordinate(marker.hex) === clean);
+}
+
+function getHexMapParty(hexMap = getHexMapState()) {
+  const cleanHex = normalizeHexCoordinate(hexMap?.party?.hex, hexMap.columns, hexMap.rows) || "";
+  return {
+    hex: cleanHex,
+    label: str(hexMap?.party?.label) || "Party",
+    notes: str(hexMap?.party?.notes),
+    updatedAt: str(hexMap?.party?.updatedAt) || "",
+    trail: Array.isArray(hexMap?.party?.trail)
+      ? hexMap.party.trail
+          .map((entry) => ({
+            hex: normalizeHexCoordinate(entry?.hex, hexMap.columns, hexMap.rows),
+            at: str(entry?.at) || "",
+          }))
+          .filter((entry) => entry.hex)
+      : [],
+  };
+}
+
+function getHexMapForcesForHex(hex) {
+  const clean = normalizeHexCoordinate(hex);
+  if (!clean) return [];
+  return getHexMapState().forces.filter((force) => normalizeHexCoordinate(force.hex) === clean);
+}
+
+function centerHexMapOnHex(hex, hexMap = getHexMapState()) {
+  const parsed = parseHexCoordinate(hex);
+  if (!parsed) return;
+  const center = getHexCenter(parsed.columnIndex, parsed.rowIndex, hexMap);
+  const metrics = getHexMapMetrics(hexMap);
+  const zoom = Math.max(HEX_MAP_ZOOM_MIN, Math.min(HEX_MAP_ZOOM_MAX, Number(hexMap.zoom || 1)));
+  hexMap.panX = center.cx - metrics.boardWidth / (2 * zoom);
+  hexMap.panY = center.cy - metrics.boardHeight / (2 * zoom);
+  clampHexMapPan(hexMap);
+}
+
+function moveHexMapPartyToHex(hex, options = {}) {
+  const hexMap = getHexMapState();
+  const cleanHex = normalizeHexCoordinate(hex, hexMap.columns, hexMap.rows);
+  if (!cleanHex) throw new Error("Select a valid hex first.");
+  const current = getHexMapParty(hexMap);
+  const nextTrail = Array.isArray(current.trail) ? [...current.trail] : [];
+  if (!nextTrail.length || nextTrail[0]?.hex !== cleanHex) {
+    nextTrail.unshift({
+      hex: cleanHex,
+      at: new Date().toISOString(),
+    });
+  } else {
+    nextTrail[0] = {
+      hex: cleanHex,
+      at: new Date().toISOString(),
+    };
+  }
+  hexMap.party = {
+    hex: cleanHex,
+    label: str(options.label) || current.label || "Party",
+    notes: options.notes !== undefined ? str(options.notes) : current.notes,
+    updatedAt: new Date().toISOString(),
+    trail: nextTrail.slice(0, 24),
+  };
+  state.hexMap = normalizeHexMapState(hexMap);
+  return getHexMapParty(hexMap);
+}
+
+function getHexLinkedLocations(hex) {
+  const clean = normalizeHexCoordinate(hex);
+  if (!clean) return [];
+  return (state.locations || []).filter((location) => normalizeHexCoordinate(location.hex) === clean);
+}
+
+function normalizeKingdomCreationChoice(section, value) {
+  const clean = str(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  if (section === "heartlands") {
+    if (/(grassland|plain|plains|hill|hills)/.test(clean)) return "hill or plain";
+    if (/(forest|swamp)/.test(clean)) return "forest or swamp";
+    if (/(lake|river)/.test(clean)) return "lake or river";
+    if (/(mountain|mountains|ruins|ruin)/.test(clean)) return "mountain or ruins";
+  }
+  if (section === "governments") {
+    if (/(council|council rule|ruling council)/.test(clean)) return "oligarchy";
+  }
+  return clean;
+}
+
+function buildKingdomSkillRanks(trainedSkills = [], existing = {}) {
+  const out = Object.fromEntries(KINGDOM_SKILL_DEFINITIONS.map((entry) => [entry.name, "untrained"]));
+  if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+    for (const [skillName, rank] of Object.entries(existing)) {
+      const cleanSkill = canonicalizeKingdomSkillName(skillName);
+      if (!cleanSkill) continue;
+      out[cleanSkill] = getKingdomSkillRank(rank);
+    }
+  }
+  for (const skillName of Array.isArray(trainedSkills) ? trainedSkills : parseSkillList(trainedSkills, true)) {
+    const cleanSkill = canonicalizeKingdomSkillName(skillName);
+    if (!cleanSkill) continue;
+    if (getKingdomSkillRankWeight(out[cleanSkill]) < getKingdomSkillRankWeight("trained")) {
+      out[cleanSkill] = "trained";
+    }
+  }
+  return out;
+}
+
+function applyQuickEditToSkillRanks(trainedSkills = [], existing = {}) {
+  const out = buildKingdomSkillRanks([], existing);
+  const wanted = new Set(Array.isArray(trainedSkills) ? trainedSkills.map((entry) => canonicalizeKingdomSkillName(entry)).filter(Boolean) : []);
+  for (const definition of KINGDOM_SKILL_DEFINITIONS) {
+    if (out[definition.name] === "trained" && !wanted.has(definition.name)) {
+      out[definition.name] = "untrained";
+    }
+  }
+  for (const skillName of wanted) {
+    if (getKingdomSkillRankWeight(out[skillName]) < getKingdomSkillRankWeight("trained")) {
+      out[skillName] = "trained";
+    }
+  }
+  return out;
+}
+
+function getKingdomUntrainedImprovisationBonus(level) {
+  const normalizedLevel = Math.max(1, Number.parseInt(String(level || "1"), 10) || 1);
+  if (normalizedLevel >= 7) {
+    return {
+      bonus: normalizedLevel,
+      label: `full level (+${normalizedLevel}) from Untrained Improvisation`
+    };
+  }
+  if (normalizedLevel >= 2) {
+    const bonus = Math.floor(normalizedLevel / 2);
+    return {
+      bonus,
+      label: `half level (+${bonus}) from Untrained Improvisation`
+    };
+  }
+  return {
+    bonus: 0,
+    label: "no proficiency bonus while untrained"
+  };
+}
+
+function getKingdomSkillProficiency(level, rank) {
+  const cleanRank = getKingdomSkillRank(rank);
+  const normalizedLevel = Math.max(1, Number.parseInt(String(level || "1"), 10) || 1);
+  if (cleanRank === "untrained") {
+    const untrained = getKingdomUntrainedImprovisationBonus(normalizedLevel);
+    return {
+      bonus: untrained.bonus,
+      label: untrained.label
+    };
+  }
+  const base = {
+    trained: 2,
+    expert: 4,
+    master: 6,
+    legendary: 8
+  }[cleanRank];
+  const bonus = normalizedLevel + base;
+  return {
+    bonus,
+    label: `${KINGDOM_SKILL_RANK_LABELS[cleanRank]} proficiency (+${base}) + level ${normalizedLevel}`
+  };
+}
+
+function getLeaderName(leader) {
+  const cleanName = str(leader?.name).trim();
+  if (cleanName) return cleanName;
+  return str(leader?.role) || "Unnamed leader";
+}
+
+function isActiveKingdomLeader(leader) {
+  const cleanName = str(leader?.name).trim();
+  return Boolean(cleanName && !/^unassigned$/i.test(cleanName));
+}
+
+function getLeaderSpecializedKingdomSkills(leader) {
+  return parseSkillList(leader?.specializedSkills, true);
+}
+
+function getLeaderLeadershipBonus(leader) {
+  return Math.max(0, Math.min(4, Number.parseInt(String(leader?.leadershipBonus || "0"), 10) || 0));
+}
+
+function formatSignedNumber(value) {
+  const number = Number.parseInt(String(value || "0"), 10) || 0;
+  return number >= 0 ? `+${number}` : String(number);
+}
+
+function getBestLeaderForKingdomSkill(kingdom, skillName) {
+  const leaders = (kingdom?.leaders || []).filter(isActiveKingdomLeader);
+  if (!leaders.length) {
+    return {
+      leader: null,
+      bonus: 0,
+      mode: "none",
+      label: "No active leader assigned"
+    };
+  }
+  const specialized = leaders
+    .filter((leader) => getLeaderSpecializedKingdomSkills(leader).includes(skillName))
+    .sort((a, b) => getLeaderLeadershipBonus(b) - getLeaderLeadershipBonus(a));
+  if (specialized.length) {
+    const leader = specialized[0];
+    const bonus = getLeaderLeadershipBonus(leader);
+    return {
+      leader,
+      bonus,
+      mode: "specialized",
+      label: `${getLeaderName(leader)} (${leader.role || "Leader"}) full Leadership Bonus`
+    };
+  }
+  const fallback = [...leaders].sort((a, b) => getLeaderLeadershipBonus(b) - getLeaderLeadershipBonus(a))[0];
+  const fallbackBonus = Math.floor(getLeaderLeadershipBonus(fallback) / 2);
+  return {
+    leader: fallback,
+    bonus: fallbackBonus,
+    mode: "fallback",
+    label: `${getLeaderName(fallback)} (${fallback.role || "Leader"}) half Leadership Bonus`
+  };
+}
+
+function getSettlementActionCount(settlement) {
+  return KINGDOM_SETTLEMENT_ACTIONS[str(settlement?.civicStructure)] || 0;
+}
+
+function getKingdomCreationReference(profile) {
+  return profile?.creationReference && typeof profile.creationReference === "object" ? profile.creationReference : {};
+}
+
+function getKingdomCreationOption(profile, section, selectedValue) {
+  const clean = normalizeKingdomCreationChoice(section, selectedValue);
+  if (!clean) return null;
+  return getKingdomCreationOptions(profile, section).find((entry) => normalizeKingdomCreationChoice(section, entry?.name) === clean) || null;
+}
+
+function countFreeAbilityBoostSlots(entry) {
+  return (entry?.abilityBoosts || []).filter((boost) => /free ability boost/i.test(str(boost))).length;
+}
+
+function calculateKingdomCreationPlan(kingdom, profile) {
+  const creation = normalizeKingdomCreationState(kingdom?.creation);
+  const charter = getKingdomCreationOption(profile, "charters", kingdom?.charter);
+  const government = getKingdomCreationOption(profile, "governments", kingdom?.government);
+  const heartland = getKingdomCreationOption(profile, "heartlands", kingdom?.heartland);
+  const reference = getKingdomCreationReference(profile);
+  const abilityAdjustments = Object.fromEntries(KINGDOM_ABILITY_KEYS.map((key) => [key, 0]));
+  const trainedSkills = [];
+  const entries = [charter, government, heartland].filter(Boolean);
+  const addAbilityAdjustment = (value, delta) => {
+    const clean = canonicalizeKingdomAbilityName(value);
+    if (!clean) return;
+    abilityAdjustments[clean] += delta;
+  };
+  const addTrainedSkill = (value) => {
+    const clean = canonicalizeKingdomSkillName(value);
+    if (!clean) return;
+    trainedSkills.push(clean);
+  };
+  for (const entry of entries) {
+    for (const boost of entry?.abilityBoosts || []) {
+      if (/free ability boost/i.test(str(boost))) continue;
+      addAbilityAdjustment(boost, 1);
+    }
+    if (entry?.abilityFlaw && str(entry.abilityFlaw).toLowerCase() !== "none") {
+      addAbilityAdjustment(entry.abilityFlaw, -1);
+    }
+    for (const skill of entry?.trainedSkills || []) {
+      addTrainedSkill(skill);
+    }
+  }
+  for (const boost of creation.freeAbilityBoosts || []) {
+    addAbilityAdjustment(boost, 1);
+  }
+  addTrainedSkill(creation.charterSkill);
+  addTrainedSkill(creation.heartlandSkill);
+  for (const skill of creation.bonusSkills || []) addTrainedSkill(skill);
+  const expectedFreeBoosts =
+    Number.parseInt(String(reference?.finalizeAbilityBoosts || "0"), 10) +
+    countFreeAbilityBoostSlots(charter) +
+    countFreeAbilityBoostSlots(government) +
+    countFreeAbilityBoostSlots(heartland);
+  const expectedFreeSkills =
+    Number.parseInt(String(reference?.charterFreeSkillChoices || "0"), 10) +
+    Number.parseInt(String(reference?.heartlandFreeSkillChoices || "0"), 10) +
+    Number.parseInt(String(reference?.additionalTrainedSkills || "0"), 10);
+  return {
+    charter,
+    government,
+    heartland,
+    creation,
+    abilityAdjustments,
+    trainedSkills: [...new Set(trainedSkills)],
+    expectedFreeBoosts,
+    expectedFreeSkills
+  };
+}
+
+function applyKingdomCreationChoicesToState(kingdom, profile) {
+  const plan = calculateKingdomCreationPlan(kingdom, profile);
+  kingdom.abilities = { ...plan.abilityAdjustments };
+  kingdom.skillRanks = buildKingdomSkillRanks(plan.trainedSkills);
+  kingdom.trainedSkills = [...plan.trainedSkills];
+  return plan;
+}
+
+function calculateKingdomDerivedState(kingdom, profile) {
+  const activeProfile = profile || getActiveKingdomProfile();
+  const normalizedKingdom = normalizeKingdomState(kingdom);
+  const activeLeaders = normalizedKingdom.leaders.filter(isActiveKingdomLeader);
+  const pcLeaders = activeLeaders.filter((leader) => str(leader?.type).toUpperCase() === "PC");
+  const npcLeaders = activeLeaders.filter((leader) => str(leader?.type).toUpperCase() !== "PC");
+  const settlementActionDetails = normalizedKingdom.settlements
+    .map((settlement) => ({
+      settlement,
+      actions: getSettlementActionCount(settlement)
+    }))
+    .filter((entry) => entry.actions > 0);
+  const settlementConsumption = normalizedKingdom.settlements.reduce(
+    (sum, settlement) => sum + Math.max(0, Number.parseInt(String(settlement?.consumption || "0"), 10) || 0),
+    0
+  );
+  const totalConsumption = normalizedKingdom.consumption + settlementConsumption;
+  const recommendedControlDC = getControlDcForLevel(activeProfile, normalizedKingdom.level);
+  const cityResourceDice = normalizedKingdom.settlements.filter((settlement) => ["City", "Metropolis"].includes(str(settlement?.size))).length;
+  const settlementResourceDice = normalizedKingdom.settlements.reduce(
+    (sum, settlement) => sum + Math.max(0, Number.parseInt(String(settlement?.resourceDice || "0"), 10) || 0),
+    0
+  );
+  const skillRows = KINGDOM_SKILL_DEFINITIONS.map((definition) => {
+    const rank = getKingdomSkillRank(normalizedKingdom?.skillRanks?.[definition.name]);
+    const proficiency = getKingdomSkillProficiency(normalizedKingdom.level, rank);
+    const leader = getBestLeaderForKingdomSkill(normalizedKingdom, definition.name);
+    const abilityScore = Number.parseInt(String(normalizedKingdom?.abilities?.[definition.ability] || "0"), 10) || 0;
+    return {
+      skill: definition.name,
+      abilityKey: definition.ability,
+      abilityLabel: `${definition.ability[0].toUpperCase()}${definition.ability.slice(1)}`,
+      abilityScore,
+      rank,
+      rankLabel: KINGDOM_SKILL_RANK_LABELS[rank],
+      proficiencyBonus: proficiency.bonus,
+      proficiencyLabel: proficiency.label,
+      leaderBonus: leader.bonus,
+      leaderLabel: leader.label,
+      leaderMode: leader.mode,
+      leaderName: leader.leader ? getLeaderName(leader.leader) : "",
+      leaderRole: str(leader?.leader?.role),
+      totalModifier: abilityScore + proficiency.bonus + leader.bonus
+    };
+  }).sort((a, b) => a.abilityLabel.localeCompare(b.abilityLabel) || a.skill.localeCompare(b.skill));
+
+  return {
+    recommendedControlDC,
+    controlDcOverride: normalizedKingdom.controlDC - recommendedControlDC,
+    pcLeaderActions: pcLeaders.length * 3,
+    npcLeaderActions: npcLeaders.length * 2,
+    settlementActions: settlementActionDetails.reduce((sum, entry) => sum + entry.actions, 0),
+    settlementActionDetails,
+    totalActions: pcLeaders.length * 3 + npcLeaders.length * 2 + settlementActionDetails.reduce((sum, entry) => sum + entry.actions, 0),
+    settlementConsumption,
+    totalConsumption,
+    foodAfterUpkeep: normalizedKingdom.commodities.food - totalConsumption,
+    settlementResourceDice,
+    cityResourceDice,
+    highestRuin: Math.max(
+      normalizedKingdom.ruin.corruption,
+      normalizedKingdom.ruin.crime,
+      normalizedKingdom.ruin.decay,
+      normalizedKingdom.ruin.strife
+    ),
+    peacefulNegotiationShift: -Math.floor(normalizedKingdom.fame / 10) + Math.floor(normalizedKingdom.infamy / 10),
+    hostileNegotiationShift: -Math.floor(normalizedKingdom.infamy / 10),
+    trainedCount: skillRows.filter((row) => row.rank !== "untrained").length,
+    advancedCount: skillRows.filter((row) => getKingdomSkillRankWeight(row.rank) > getKingdomSkillRankWeight("trained")).length,
+    activeLeaderCount: activeLeaders.length,
+    expectedRoleCount: Array.isArray(activeProfile?.leadershipRoles) ? activeProfile.leadershipRoles.length : 8,
+    skillRows
+  };
+}
+
 function getControlDcForLevel(profile, level) {
   const normalizedLevel = Math.max(1, Number.parseInt(String(level || "1"), 10) || 1);
   const table = Array.isArray(profile?.advancement) ? profile.advancement : [];
@@ -2241,7 +3755,7 @@ function getControlDcForLevel(profile, level) {
 
 function createStarterKingdomState() {
   const profile = getKingdomProfileById(getDefaultKingdomProfileId());
-  return {
+  const kingdom = {
     profileId: profile?.id || getDefaultKingdomProfileId(),
     name: "Stolen Lands Charter",
     charter: "Open charter",
@@ -2257,6 +3771,8 @@ function createStarterKingdomState() {
     resourcePoints: 0,
     xp: 0,
     trainedSkills: ["Agriculture", "Politics", "Trade", "Wilderness"],
+    skillRanks: buildKingdomSkillRanks(["Agriculture", "Politics", "Trade", "Wilderness"]),
+    creation: createStarterKingdomCreationState(),
     abilities: {
       culture: 0,
       economy: 0,
@@ -2324,6 +3840,8 @@ function createStarterKingdomState() {
       "Create the first real settlement record once the capital is founded."
     ]
   };
+  applyKingdomCreationChoicesToState(kingdom, profile);
+  return kingdom;
 }
 
 function normalizeKingdomState(input) {
@@ -2346,12 +3864,17 @@ function normalizeKingdomState(input) {
   out.resourceDie = ["d4", "d6", "d8", "d10", "d12"].includes(str(out.resourceDie)) ? str(out.resourceDie) : "d4";
   out.resourcePoints = Number.parseInt(String(out.resourcePoints || "0"), 10) || 0;
   out.xp = Number.parseInt(String(out.xp || "0"), 10) || 0;
-  out.trainedSkills = Array.isArray(out.trainedSkills)
+  const normalizedTrainedSkills = Array.isArray(out.trainedSkills)
     ? out.trainedSkills.map((skill) => str(skill)).filter(Boolean)
     : str(out.trainedSkills)
         .split(",")
         .map((skill) => str(skill).trim())
         .filter(Boolean);
+  out.creation = normalizeKingdomCreationState(out.creation);
+  out.skillRanks = buildKingdomSkillRanks(normalizedTrainedSkills, out.skillRanks);
+  out.trainedSkills = KINGDOM_SKILL_DEFINITIONS.map((entry) => entry.name).filter(
+    (skillName) => getKingdomSkillRankWeight(out.skillRanks?.[skillName]) >= getKingdomSkillRankWeight("trained")
+  );
   out.abilities = {
     culture: Number.parseInt(String(out?.abilities?.culture || "0"), 10) || 0,
     economy: Number.parseInt(String(out?.abilities?.economy || "0"), 10) || 0,
@@ -2383,7 +3906,14 @@ function normalizeKingdomState(input) {
   out.settlements = Array.isArray(out.settlements)
     ? out.settlements.map((settlement) => ({ ...settlement, id: str(settlement?.id) || uid(), updatedAt: str(settlement?.updatedAt) || "" }))
     : [];
-  out.regions = Array.isArray(out.regions) ? out.regions.map((region) => ({ ...region, id: str(region?.id) || uid(), updatedAt: str(region?.updatedAt) || "" })) : [];
+  out.regions = Array.isArray(out.regions)
+    ? out.regions.map((region) => ({
+        ...region,
+        id: str(region?.id) || uid(),
+        hex: normalizeHexCoordinate(region?.hex) || str(region?.hex),
+        updatedAt: str(region?.updatedAt) || "",
+      }))
+    : [];
   out.turns = Array.isArray(out.turns) ? out.turns.map((turn) => ({ ...turn, id: str(turn?.id) || uid(), updatedAt: str(turn?.updatedAt) || "" })) : [];
   return out;
 }
@@ -2398,6 +3928,7 @@ function getKingdomState() {
 function buildKingdomAiContext(kingdom, profile) {
   const data = kingdom && typeof kingdom === "object" ? kingdom : getKingdomState();
   const rulesProfile = profile || getActiveKingdomProfile();
+  const derived = calculateKingdomDerivedState(data, rulesProfile);
   return {
     name: data.name,
     currentTurnLabel: data.currentTurnLabel,
@@ -2405,12 +3936,23 @@ function buildKingdomAiContext(kingdom, profile) {
     level: data.level,
     size: data.size,
     controlDC: data.controlDC,
+    recommendedControlDC: derived.recommendedControlDC,
     resourceDie: data.resourceDie,
     resourcePoints: data.resourcePoints,
     trainedSkills: [...(data.trainedSkills || [])].slice(0, 16),
+    skillRanks: { ...(data.skillRanks || {}) },
+    skillModifiers: derived.skillRows.map((entry) => ({
+      skill: entry.skill,
+      linkedAbility: entry.abilityLabel,
+      rank: entry.rankLabel,
+      modifier: entry.totalModifier,
+      leader: entry.leaderName || "No active leader"
+    })),
     abilities: { ...(data.abilities || {}) },
     commodities: { ...(data.commodities || {}) },
     consumption: data.consumption,
+    totalConsumption: derived.totalConsumption,
+    foodAfterUpkeep: derived.foodAfterUpkeep,
     renown: data.renown,
     fame: data.fame,
     infamy: data.infamy,
@@ -2446,6 +3988,13 @@ function applyKingdomOverviewForm(fields) {
   kingdom.currentDate = str(fields.currentDate);
   kingdom.level = Math.max(1, Number.parseInt(String(fields.level || kingdom.level || "1"), 10) || 1);
   kingdom.size = Math.max(1, Number.parseInt(String(fields.size || kingdom.size || "1"), 10) || 1);
+  kingdom.creation = normalizeKingdomCreationState({
+    ...(kingdom.creation || createStarterKingdomCreationState()),
+    freeAbilityBoosts: fields.creationFreeAbilityBoosts,
+    charterSkill: fields.creationCharterSkill,
+    heartlandSkill: fields.creationHeartlandSkill,
+    bonusSkills: fields.creationBonusSkills
+  });
   kingdom.controlDC = Math.max(
     10,
     Number.parseInt(String(fields.controlDC || getControlDcForLevel(profile, kingdom.level)), 10) || getControlDcForLevel(profile, kingdom.level)
@@ -2453,10 +4002,17 @@ function applyKingdomOverviewForm(fields) {
   kingdom.resourceDie = ["d4", "d6", "d8", "d10", "d12"].includes(str(fields.resourceDie)) ? str(fields.resourceDie) : kingdom.resourceDie;
   kingdom.resourcePoints = Number.parseInt(String(fields.resourcePoints || kingdom.resourcePoints || "0"), 10) || 0;
   kingdom.xp = Number.parseInt(String(fields.xp || kingdom.xp || "0"), 10) || 0;
-  kingdom.trainedSkills = str(fields.trainedSkills)
-    .split(",")
-    .map((skill) => str(skill).trim())
-    .filter(Boolean);
+  const nextSkillRanks = applyQuickEditToSkillRanks(parseSkillList(fields.trainedSkills, true), kingdom.skillRanks);
+  for (const definition of KINGDOM_SKILL_DEFINITIONS) {
+    const fieldName = `skillRank__${slugify(definition.name)}`;
+    if (fieldName in fields) {
+      nextSkillRanks[definition.name] = getKingdomSkillRank(fields[fieldName]);
+    }
+  }
+  kingdom.skillRanks = nextSkillRanks;
+  kingdom.trainedSkills = KINGDOM_SKILL_DEFINITIONS.map((entry) => entry.name).filter(
+    (skillName) => getKingdomSkillRankWeight(nextSkillRanks?.[skillName]) >= getKingdomSkillRankWeight("trained")
+  );
   kingdom.abilities = {
     culture: Number.parseInt(String(fields.culture || kingdom.abilities.culture || "0"), 10) || 0,
     economy: Number.parseInt(String(fields.economy || kingdom.abilities.economy || "0"), 10) || 0,
@@ -2485,16 +4041,25 @@ function applyKingdomOverviewForm(fields) {
   kingdom.notes = str(fields.notes);
 }
 
+function recalculateKingdomFromCreationChoices(fields) {
+  applyKingdomOverviewForm(fields);
+  const kingdom = getKingdomState();
+  const profile = getKingdomProfileById(kingdom.profileId);
+  return applyKingdomCreationChoicesToState(kingdom, profile);
+}
+
 function createKingdomLeader(fields) {
   const kingdom = getKingdomState();
+  const role = str(fields.role) || "Leader";
+  const roleProfile = (getActiveKingdomProfile()?.leadershipRoles || []).find((entry) => str(entry?.role) === role);
   kingdom.leaders.unshift({
     id: uid(),
-    role: str(fields.role) || "Leader",
+    role,
     name: str(fields.name) || "Unnamed leader",
     type: str(fields.type) || "NPC",
     leadershipBonus: Number.parseInt(String(fields.leadershipBonus || "0"), 10) || 0,
-    relevantSkills: str(fields.relevantSkills),
-    specializedSkills: str(fields.specializedSkills),
+    relevantSkills: str(fields.relevantSkills) || (roleProfile?.relevantSkills || []).join(", "),
+    specializedSkills: str(fields.specializedSkills) || (roleProfile?.specializedSkills || []).join(", "),
     notes: str(fields.notes),
     updatedAt: new Date().toISOString()
   });
@@ -2517,15 +4082,158 @@ function createKingdomSettlement(fields) {
 
 function createKingdomRegion(fields) {
   const kingdom = getKingdomState();
+  const hexMap = getHexMapState();
   kingdom.regions.unshift({
     id: uid(),
-    hex: str(fields.hex) || "Unknown hex",
+    hex: normalizeHexCoordinate(fields.hex, hexMap.columns, hexMap.rows) || str(fields.hex) || "Unknown hex",
     status: str(fields.status) || "Claimed",
     terrain: str(fields.terrain),
     workSite: str(fields.workSite),
     notes: str(fields.notes),
     updatedAt: new Date().toISOString()
   });
+}
+
+function applyHexMapSettings(fields) {
+  const hexMap = getHexMapState();
+  hexMap.mapName = str(fields.mapName) || hexMap.mapName;
+  hexMap.columns = Math.max(
+    HEX_MAP_COLUMNS_MIN,
+    Math.min(HEX_MAP_COLUMNS_MAX, Number.parseInt(String(fields.columns || hexMap.columns), 10) || hexMap.columns)
+  );
+  hexMap.rows = Math.max(
+    HEX_MAP_ROWS_MIN,
+    Math.min(HEX_MAP_ROWS_MAX, Number.parseInt(String(fields.rows || hexMap.rows), 10) || hexMap.rows)
+  );
+  hexMap.hexSize = Math.max(
+    HEX_MAP_HEX_SIZE_MIN,
+    Math.min(HEX_MAP_HEX_SIZE_MAX, Number.parseInt(String(fields.hexSize || hexMap.hexSize), 10) || hexMap.hexSize)
+  );
+  hexMap.backgroundOpacity = Math.max(
+    0,
+    Math.min(0.95, Number.parseFloat(String(fields.backgroundOpacity ?? hexMap.backgroundOpacity)) || hexMap.backgroundOpacity)
+  );
+  hexMap.backgroundScale = Math.max(
+    HEX_MAP_BACKGROUND_SCALE_MIN,
+    Math.min(
+      HEX_MAP_BACKGROUND_SCALE_MAX,
+      Number.parseFloat(String(fields.backgroundScale ?? hexMap.backgroundScale)) || hexMap.backgroundScale
+    )
+  );
+  hexMap.backgroundOffsetX = Number.isFinite(Number.parseFloat(String(fields.backgroundOffsetX)))
+    ? Number.parseFloat(String(fields.backgroundOffsetX))
+    : hexMap.backgroundOffsetX;
+  hexMap.backgroundOffsetY = Number.isFinite(Number.parseFloat(String(fields.backgroundOffsetY)))
+    ? Number.parseFloat(String(fields.backgroundOffsetY))
+    : hexMap.backgroundOffsetY;
+  hexMap.gridFillOpacity = Math.max(
+    0,
+    Math.min(0.65, Number.parseFloat(String(fields.gridFillOpacity ?? hexMap.gridFillOpacity)) || hexMap.gridFillOpacity)
+  );
+  hexMap.gridLineOpacity = Math.max(
+    0.15,
+    Math.min(1, Number.parseFloat(String(fields.gridLineOpacity ?? hexMap.gridLineOpacity)) || hexMap.gridLineOpacity)
+  );
+  hexMap.showLabels = String(fields.showLabels || "true") !== "false";
+  clampHexMapPan(hexMap);
+  state.hexMap = normalizeHexMapState(hexMap);
+  setHexMapSelectedHex(ui.hexMapSelectedHex || "A1");
+}
+
+function upsertHexMapRegion(fields) {
+  const kingdom = getKingdomState();
+  const hexMap = getHexMapState();
+  const hex = normalizeHexCoordinate(fields.hex, hexMap.columns, hexMap.rows);
+  if (!hex) throw new Error("Select a valid hex first.");
+  const existing = kingdom.regions.find((region) => normalizeHexCoordinate(region.hex) === hex);
+  const patch = {
+    hex,
+    status: str(fields.status) || "Claimed",
+    terrain: str(fields.terrain),
+    workSite: str(fields.workSite),
+    notes: str(fields.notes),
+    updatedAt: new Date().toISOString(),
+  };
+  if (existing) {
+    Object.assign(existing, patch);
+    return existing;
+  }
+  const created = {
+    id: uid(),
+    ...patch,
+  };
+  kingdom.regions.unshift(created);
+  return created;
+}
+
+function clearHexMapRegion(hex) {
+  const kingdom = getKingdomState();
+  const clean = normalizeHexCoordinate(hex);
+  if (!clean) return false;
+  const before = kingdom.regions.length;
+  kingdom.regions = kingdom.regions.filter((region) => normalizeHexCoordinate(region.hex) !== clean);
+  return kingdom.regions.length !== before;
+}
+
+function createHexMapMarker(fields) {
+  const hexMap = getHexMapState();
+  const hex = normalizeHexCoordinate(fields.hex, hexMap.columns, hexMap.rows);
+  if (!hex) throw new Error("Select a valid hex first.");
+  const marker = {
+    id: uid(),
+    hex,
+    type: HEX_MAP_MARKER_TYPES.includes(str(fields.type)) ? str(fields.type) : "Note",
+    title: str(fields.title) || "Untitled marker",
+    notes: str(fields.notes),
+    updatedAt: new Date().toISOString(),
+  };
+  hexMap.markers.unshift(marker);
+  state.hexMap = normalizeHexMapState(hexMap);
+  return marker;
+}
+
+function upsertHexMapParty(fields) {
+  return moveHexMapPartyToHex(fields.hex, {
+    label: fields.label,
+    notes: fields.notes,
+  });
+}
+
+function createHexMapForce(fields) {
+  const hexMap = getHexMapState();
+  const hex = normalizeHexCoordinate(fields.hex, hexMap.columns, hexMap.rows);
+  if (!hex) throw new Error("Select a valid hex first.");
+  const force = {
+    id: uid(),
+    hex,
+    type: HEX_MAP_FORCE_TYPES.includes(str(fields.type)) ? str(fields.type) : "Allied Force",
+    name: str(fields.name) || "Unnamed force",
+    notes: str(fields.notes),
+    updatedAt: new Date().toISOString(),
+  };
+  hexMap.forces.unshift(force);
+  state.hexMap = normalizeHexMapState(hexMap);
+  return force;
+}
+
+function appendHexMapAiNote(text) {
+  const hex = getHexMapSelectedHex();
+  const region = getKingdomRegionByHex(hex);
+  const stamp = new Date().toLocaleString();
+  const block = `[AI ${stamp}]\n${str(text)}`;
+  if (region) {
+    region.notes = region.notes ? `${region.notes}\n\n${block}`.trim() : block;
+    region.updatedAt = new Date().toISOString();
+  } else {
+    createKingdomRegion({
+      hex,
+      status: "Reconnoitered",
+      terrain: "",
+      workSite: "",
+      notes: block,
+    });
+  }
+  saveState();
 }
 
 function applyKingdomTurnForm(fields) {
@@ -2597,6 +4305,7 @@ function appendKingdomAiNote(text) {
 function renderKingdom() {
   const kingdom = getKingdomState();
   const profile = getActiveKingdomProfile();
+  const derived = calculateKingdomDerivedState(kingdom, profile);
   const sourceLines = Array.isArray(profile?.sources)
     ? profile.sources
         .map((source) => `${source.title}${source.role ? ` (${source.role})` : ""}`)
@@ -2639,6 +4348,8 @@ function renderKingdom() {
         }
       </section>
 
+      ${renderKingdomDerivedPanel(kingdom, profile, derived)}
+
       <section class="panel step-card">
         <div class="step-head">
           <span class="step-badge">1</span>
@@ -2665,15 +4376,19 @@ function renderKingdom() {
           </div>
           <div class="row">
             <label>Charter
-              <input name="charter" value="${escapeHtml(kingdom.charter || "")}" placeholder="Open charter" />
+              ${renderKingdomCreationSelect("charter", profile, "charters", kingdom.charter, "Choose a charter")}
             </label>
             <label>Government
-              <input name="government" value="${escapeHtml(kingdom.government || "")}" placeholder="Council" />
+              ${renderKingdomCreationSelect("government", profile, "governments", kingdom.government, "Choose a government")}
             </label>
             <label>Heartland
-              <input name="heartland" value="${escapeHtml(kingdom.heartland || "")}" placeholder="Grassland" />
+              ${renderKingdomCreationSelect("heartland", profile, "heartlands", kingdom.heartland, "Choose a heartland")}
             </label>
           </div>
+          <div data-kingdom-choice-summary>
+            ${renderKingdomCreationChoiceSummary(kingdom, profile)}
+          </div>
+          ${renderKingdomCreationPlanner(kingdom, profile)}
           <div class="row">
             <label>Current Turn Label
               <input name="currentTurnLabel" value="${escapeHtml(kingdom.currentTurnLabel || "")}" placeholder="Turn 3" />
@@ -2771,9 +4486,11 @@ function renderKingdom() {
               <input name="ruinThreshold" type="number" min="1" value="${escapeHtml(String(kingdom.ruin.threshold || 5))}" />
             </label>
           </div>
-          <label>Trained Skills (comma separated)
+          <label>Trained Skills (quick edit, comma separated)
             <input name="trainedSkills" value="${escapeHtml((kingdom.trainedSkills || []).join(", "))}" placeholder="Agriculture, Politics, Trade, Wilderness" />
           </label>
+          <p class="small">This quick-edit list auto-syncs with the rank table below. Use the table for Expert, Master, and Legendary skills and to see the actual modifier math.</p>
+          ${renderKingdomSkillMatrix(kingdom, derived)}
           <label>Kingdom Notes
             <textarea name="notes" placeholder="Track active plans, open rulings, and the state of the kingdom here.">${escapeHtml(kingdom.notes || "")}</textarea>
           </label>
@@ -2990,6 +4707,441 @@ function renderKingdom() {
   `;
 }
 
+function renderKingdomDerivedPanel(kingdom, profile, derived) {
+  const controlDcNote =
+    derived.controlDcOverride === 0
+      ? `Matches the level ${kingdom.level} profile value.`
+      : `${derived.controlDcOverride > 0 ? "Override above" : "Override below"} profile default by ${Math.abs(derived.controlDcOverride)}.`;
+  const settlementActionNote = derived.settlementActionDetails.length
+    ? derived.settlementActionDetails.map((entry) => `${entry.settlement.name || "Settlement"} +${entry.actions}`).join(" • ")
+    : "No civic structures are adding settlement actions yet.";
+  return `
+    <section class="kingdom-overview-grid kingdom-derived-grid">
+      <article class="panel">
+        <h2>Computed Summary</h2>
+        <div class="card-list kingdom-derived-cards">
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Control DC</span>
+              <span class="entry-meta">${escapeHtml(String(kingdom.controlDC || 14))}</span>
+            </div>
+            <p>Recommended from ${escapeHtml(profile?.shortLabel || profile?.label || "profile")} at level ${escapeHtml(String(kingdom.level || 1))}: <strong>${escapeHtml(String(derived.recommendedControlDC))}</strong>.</p>
+            <p class="small">${escapeHtml(controlDcNote)}</p>
+          </article>
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Action Economy</span>
+              <span class="entry-meta">${escapeHtml(String(derived.totalActions))} total</span>
+            </div>
+            <p><strong>${escapeHtml(String(derived.pcLeaderActions))}</strong> from PC leaders, <strong>${escapeHtml(String(derived.npcLeaderActions))}</strong> from NPC leaders, and <strong>${escapeHtml(String(derived.settlementActions))}</strong> from settlements.</p>
+            <p class="small">${escapeHtml(settlementActionNote)}</p>
+          </article>
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Upkeep</span>
+              <span class="entry-meta">${escapeHtml(String(derived.totalConsumption))} total consumption</span>
+            </div>
+            <p>Kingdom base consumption <strong>${escapeHtml(String(kingdom.consumption || 0))}</strong> + settlement consumption <strong>${escapeHtml(String(derived.settlementConsumption))}</strong>.</p>
+            <p class="small">Food after upkeep preview: <strong>${escapeHtml(String(derived.foodAfterUpkeep))}</strong>.</p>
+          </article>
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Skill Coverage</span>
+              <span class="entry-meta">${escapeHtml(String(derived.trainedCount))} trained+</span>
+            </div>
+            <p><strong>${escapeHtml(String(derived.advancedCount))}</strong> skills are above Trained. Active leaders assigned: <strong>${escapeHtml(String(derived.activeLeaderCount))}</strong> / ${escapeHtml(String(derived.expectedRoleCount))} expected roles.</p>
+            <p class="small">If a skill has no specialized leader, the sheet falls back to half of the best Leadership Bonus.</p>
+          </article>
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Negotiation Pressure</span>
+              <span class="entry-meta">Fame ${escapeHtml(String(kingdom.fame || 0))} • Infamy ${escapeHtml(String(kingdom.infamy || 0))}</span>
+            </div>
+            <p>Peaceful negotiation DC shift: <strong>${escapeHtml(formatSignedNumber(derived.peacefulNegotiationShift))}</strong>. Hostile negotiation DC shift: <strong>${escapeHtml(formatSignedNumber(derived.hostileNegotiationShift))}</strong>.</p>
+            <p class="small">Every 10 Fame helps peaceful negotiations. Every 10 Infamy helps hostile negotiations but hurts peaceful ones.</p>
+          </article>
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Ruin Watch</span>
+              <span class="entry-meta">Threshold ${escapeHtml(String(kingdom.ruin.threshold || 5))}</span>
+            </div>
+            <p>Highest ruin track: <strong>${escapeHtml(String(derived.highestRuin))}</strong>. You have <strong>${escapeHtml(String(Math.max(0, (kingdom.ruin.threshold || 5) - derived.highestRuin)))}</strong> before the threshold is met on that track.</p>
+            <p class="small">Settlement resource dice tracked: <strong>${escapeHtml(String(derived.settlementResourceDice))}</strong>. City-size bonus settlements: <strong>${escapeHtml(String(derived.cityResourceDice))}</strong>.</p>
+          </article>
+        </div>
+      </article>
+    </section>
+  `;
+}
+
+function renderKingdomSkillMatrix(kingdom, derived) {
+  const rows = (derived?.skillRows || [])
+    .map((entry) => {
+      const selectName = `skillRank__${slugify(entry.skill)}`;
+      return `
+        <tr>
+          <td><strong>${escapeHtml(entry.skill)}</strong></td>
+          <td>${escapeHtml(entry.abilityLabel)} ${escapeHtml(formatSignedNumber(entry.abilityScore))}</td>
+          <td>
+            <select name="${escapeHtml(selectName)}">
+              ${KINGDOM_SKILL_RANKS.map(
+                (rank) =>
+                  `<option value="${rank}" ${entry.rank === rank ? "selected" : ""}>${escapeHtml(KINGDOM_SKILL_RANK_LABELS[rank])}</option>`
+              ).join("")}
+            </select>
+          </td>
+          <td>${escapeHtml(formatSignedNumber(entry.proficiencyBonus))}</td>
+          <td>${escapeHtml(formatSignedNumber(entry.leaderBonus))}</td>
+          <td><strong>${escapeHtml(formatSignedNumber(entry.totalModifier))}</strong></td>
+          <td>${escapeHtml(entry.leaderLabel)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+  return `
+    <details class="session-edit-panel kingdom-skill-panel" open>
+      <summary>Computed Kingdom Skill Modifiers</summary>
+      <p class="small">Final modifier = linked ability + proficiency from rank/level + best Leadership Bonus for that skill.</p>
+      <div class="readable-table-wrap kingdom-skill-table-wrap">
+        <table class="readable-table kingdom-skill-table">
+          <thead>
+            <tr>
+              <th>Skill</th>
+              <th>Linked Ability</th>
+              <th>Rank</th>
+              <th>Prof</th>
+              <th>Leader</th>
+              <th>Total</th>
+              <th>Why</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  `;
+}
+
+function getKingdomCreationOptions(profile, section) {
+  return Array.isArray(profile?.creationReference?.[section]) ? profile.creationReference[section] : [];
+}
+
+function getKingdomCreationDisplayValue(profile, section, selectedValue) {
+  return getKingdomCreationOption(profile, section, selectedValue)?.name || str(selectedValue);
+}
+
+function renderKingdomCreationSelect(name, profile, section, selectedValue, placeholder = "Choose...") {
+  const options = getKingdomCreationOptions(profile, section);
+  const displayValue = getKingdomCreationDisplayValue(profile, section, selectedValue);
+  const hasExactOption = options.some((entry) => str(entry?.name) === displayValue);
+  const customOption = displayValue && !hasExactOption
+    ? `<option value="${escapeHtml(displayValue)}" selected>${escapeHtml(displayValue)} (custom/manual)</option>`
+    : "";
+  return `
+    <select name="${escapeHtml(name)}" data-kingdom-preview-field="${escapeHtml(name)}">
+      <option value="">${escapeHtml(placeholder)}</option>
+      ${customOption}
+      ${options
+        .map((entry) => {
+          const optionName = str(entry?.name);
+          return `<option value="${escapeHtml(optionName)}" ${optionName === displayValue ? "selected" : ""}>${escapeHtml(optionName)}</option>`;
+        })
+        .join("")}
+    </select>
+  `;
+}
+
+function renderKingdomChoiceSkillSelect(name, selectedValue, placeholder = "Choose a skill") {
+  const cleanValue = canonicalizeKingdomSkillName(selectedValue);
+  return `
+    <select name="${escapeHtml(name)}" data-kingdom-preview-field="${escapeHtml(name)}">
+      <option value="">${escapeHtml(placeholder)}</option>
+      ${KINGDOM_SKILL_DEFINITIONS.map((entry) => {
+        const optionName = str(entry?.name);
+        return `<option value="${escapeHtml(optionName)}" ${optionName === cleanValue ? "selected" : ""}>${escapeHtml(optionName)}</option>`;
+      }).join("")}
+    </select>
+  `;
+}
+
+function renderKingdomChoiceMultiSelect(name, selectedValues, items, mapLabel, size = 4) {
+  const selectedSet = new Set(Array.isArray(selectedValues) ? selectedValues.map((entry) => str(entry)) : []);
+  return `
+    <select name="${escapeHtml(name)}" multiple size="${escapeHtml(String(size))}" class="kingdom-multi-select" data-kingdom-preview-field="${escapeHtml(name)}">
+      ${items
+        .map((value) => {
+          const itemValue = str(value);
+          const label = mapLabel ? mapLabel(itemValue) : itemValue;
+          return `<option value="${escapeHtml(itemValue)}" ${selectedSet.has(itemValue) ? "selected" : ""}>${escapeHtml(label)}</option>`;
+        })
+        .join("")}
+    </select>
+  `;
+}
+
+function getFormFields(form) {
+  const formData = new FormData(form);
+  const out = {};
+  for (const [key, value] of formData.entries()) {
+    if (key in out) {
+      if (Array.isArray(out[key])) {
+        out[key].push(value);
+      } else {
+        out[key] = [out[key], value];
+      }
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function buildKingdomCreationPreviewDraft(fields) {
+  const current = getKingdomState();
+  const profile = getKingdomProfileById(str(fields.profileId) || current.profileId || getDefaultKingdomProfileId());
+  const draft = normalizeKingdomState({
+    ...current,
+    profileId: profile?.id || current.profileId,
+    charter: str(fields.charter),
+    government: str(fields.government),
+    heartland: str(fields.heartland),
+    creation: normalizeKingdomCreationState({
+      ...(current.creation || createStarterKingdomCreationState()),
+      freeAbilityBoosts: fields.creationFreeAbilityBoosts,
+      charterSkill: fields.creationCharterSkill,
+      heartlandSkill: fields.creationHeartlandSkill,
+      bonusSkills: fields.creationBonusSkills
+    })
+  });
+  return { kingdom: draft, profile };
+}
+
+function renderKingdomCreationPlannerChipsFromPlan(plan) {
+  const freeBoostTargets = plan.expectedFreeBoosts || 0;
+  const freeSkillTargets = plan.expectedFreeSkills || 0;
+  return `
+    <span class="chip">Expected free ability boosts ${escapeHtml(String(freeBoostTargets))}</span>
+    <span class="chip">Expected free skill picks ${escapeHtml(String(freeSkillTargets))}</span>
+    <span class="chip">Current free boosts entered ${escapeHtml(String((plan?.creation?.freeAbilityBoosts || []).length))}</span>
+    <span class="chip">Current free skills entered ${escapeHtml(
+      String([plan?.creation?.charterSkill, plan?.creation?.heartlandSkill, ...((plan?.creation?.bonusSkills || []))].filter(Boolean).length)
+    )}</span>
+  `;
+}
+
+function renderKingdomCreationPlannerBaselineFromPlan(plan) {
+  return `Current recalculated baseline if applied now: ${escapeHtml(
+    KINGDOM_ABILITY_KEYS.map((key) => `${KINGDOM_ABILITY_LABELS[key]} ${formatSignedNumber(plan.abilityAdjustments[key])}`).join(" • ")
+  )}. Skills: ${escapeHtml(plan.trainedSkills.join(", ") || "None")}`;
+}
+
+function syncKingdomCreationPreview(form) {
+  if (!(form instanceof HTMLFormElement) || form.dataset.form !== "kingdom-overview") return;
+  const fields = getFormFields(form);
+  const { kingdom, profile } = buildKingdomCreationPreviewDraft(fields);
+  const plan = calculateKingdomCreationPlan(kingdom, profile);
+
+  const summaryTarget = form.querySelector("[data-kingdom-choice-summary]");
+  if (summaryTarget) {
+    summaryTarget.innerHTML = renderKingdomCreationChoiceSummary(kingdom, profile);
+  }
+
+  const chipTarget = form.querySelector("[data-kingdom-creation-chips]");
+  if (chipTarget) {
+    chipTarget.innerHTML = renderKingdomCreationPlannerChipsFromPlan(plan);
+  }
+
+  const baselineTarget = form.querySelector("[data-kingdom-creation-baseline]");
+  if (baselineTarget) {
+    baselineTarget.textContent = `Current recalculated baseline if applied now: ${KINGDOM_ABILITY_KEYS.map(
+      (key) => `${KINGDOM_ABILITY_LABELS[key]} ${formatSignedNumber(plan.abilityAdjustments[key])}`
+    ).join(" • ")}. Skills: ${plan.trainedSkills.join(", ") || "None"}`;
+  }
+
+  const referenceTarget = appEl.querySelector("[data-kingdom-creation-reference]");
+  if (referenceTarget) {
+    referenceTarget.innerHTML = renderKingdomCreationReference(profile, kingdom);
+  }
+}
+
+function renderKingdomCreationChoiceSummary(kingdom, profile) {
+  const charter = getKingdomCreationOption(profile, "charters", kingdom?.charter);
+  const government = getKingdomCreationOption(profile, "governments", kingdom?.government);
+  const heartland = getKingdomCreationOption(profile, "heartlands", kingdom?.heartland);
+  const cards = [
+    {
+      title: "Current Charter",
+      selected: getKingdomCreationDisplayValue(profile, "charters", kingdom?.charter) || "Not set",
+      option: charter
+    },
+    {
+      title: "Current Government",
+      selected: getKingdomCreationDisplayValue(profile, "governments", kingdom?.government) || "Not set",
+      option: government
+    },
+    {
+      title: "Current Heartland",
+      selected: getKingdomCreationDisplayValue(profile, "heartlands", kingdom?.heartland) || "Not set",
+      option: heartland
+    }
+  ];
+  return `
+    <div class="card-list kingdom-choice-summary-grid">
+      ${cards
+        .map((card) => {
+          const option = card.option;
+          return `
+            <article class="entry">
+              <div class="entry-head">
+                <span class="entry-title">${escapeHtml(card.title)}</span>
+                <span class="entry-meta">${escapeHtml(card.selected)}</span>
+              </div>
+              <p>${escapeHtml(option?.summary || "No structured rule note found for the current entry.")}</p>
+              ${
+                option
+                  ? `<p class="small"><strong>Effects:</strong> ${escapeHtml(
+                      [
+                        ...(option.abilityBoosts || []).map((entry) => `Boost ${entry}`),
+                        option.abilityFlaw && option.abilityFlaw !== "None" ? `Flaw ${option.abilityFlaw}` : option?.abilityFlaw === "None" ? "No ability flaw" : "",
+                        ...(option.trainedSkills || []).map((entry) => `Train ${entry}`),
+                        option?.bonusFeat ? `Bonus feat ${option.bonusFeat}` : ""
+                      ]
+                        .filter(Boolean)
+                        .join(" • ")
+                    )}</p>`
+                  : `<p class="small">Use one of the listed profile options below if you want the sheet to explain it automatically.</p>`
+              }
+            </article>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderKingdomCreationPlanner(kingdom, profile) {
+  const plan = calculateKingdomCreationPlan(kingdom, profile);
+  return `
+    <details class="session-edit-panel kingdom-creation-panel" open>
+      <summary>Creation Planner</summary>
+      <p class="small">Use this to apply the level-1 creation package from your selected charter, government, and heartland. The recalc button overwrites the current kingdom ability modifiers and trained-skill baseline.</p>
+      <div class="kingdom-chip-row" data-kingdom-creation-chips>
+        ${renderKingdomCreationPlannerChipsFromPlan(plan)}
+      </div>
+      <div class="row">
+        <label>Free Ability Boosts
+          ${renderKingdomChoiceMultiSelect(
+            "creationFreeAbilityBoosts",
+            kingdom?.creation?.freeAbilityBoosts || [],
+            KINGDOM_ABILITY_KEYS,
+            (value) => KINGDOM_ABILITY_LABELS[value] || value,
+            4
+          )}
+        </label>
+        <label>Charter Free Skill
+          ${renderKingdomChoiceSkillSelect("creationCharterSkill", kingdom?.creation?.charterSkill || "", "Choose charter free skill")}
+        </label>
+        <label>Heartland Free Skill
+          ${renderKingdomChoiceSkillSelect("creationHeartlandSkill", kingdom?.creation?.heartlandSkill || "", "Choose heartland free skill")}
+        </label>
+      </div>
+      <label>Additional Starting Skills
+        ${renderKingdomChoiceMultiSelect(
+          "creationBonusSkills",
+          kingdom?.creation?.bonusSkills || [],
+          KINGDOM_SKILL_DEFINITIONS.map((entry) => entry.name),
+          null,
+          8
+        )}
+      </label>
+      <p class="small">Tip: hold <strong>Ctrl</strong> while clicking to select multiple boosts or multiple starting skills.</p>
+      <p class="small">Selections here update the preview immediately. The kingdom sheet itself changes only when you click the recalculate button.</p>
+      <p class="small" data-kingdom-creation-baseline>${renderKingdomCreationPlannerBaselineFromPlan(plan)}</p>
+      <div class="toolbar">
+        <button class="btn btn-secondary" type="button" data-action="kingdom-recalculate-creation">Recalculate from Creation Choices</button>
+      </div>
+    </details>
+  `;
+}
+
+function renderKingdomCreationReference(profile, kingdom) {
+  const sections = [
+    {
+      title: "Charters",
+      key: "charters",
+      selected: getKingdomCreationDisplayValue(profile, "charters", kingdom?.charter)
+    },
+    {
+      title: "Governments",
+      key: "governments",
+      selected: getKingdomCreationDisplayValue(profile, "governments", kingdom?.government)
+    },
+    {
+      title: "Heartlands",
+      key: "heartlands",
+      selected: getKingdomCreationDisplayValue(profile, "heartlands", kingdom?.heartland)
+    }
+  ];
+  const note = str(profile?.creationReference?.sourceNote);
+  return `
+    ${note ? `<p class="small">${escapeHtml(note)}</p>` : ""}
+    <div class="kingdom-guide-grid">
+      ${sections
+        .map((section) => {
+          const entries = getKingdomCreationOptions(profile, section.key);
+          if (!entries.length) return "";
+          return `
+            <article class="entry">
+              <div class="entry-head">
+                <span class="entry-title">${escapeHtml(section.title)}</span>
+                <span class="entry-meta">${escapeHtml(section.selected || "Not set")}</span>
+              </div>
+              <div class="card-list kingdom-choice-card-grid">
+                ${entries
+                  .map((entry) => {
+                    const active =
+                      normalizeKingdomCreationChoice(section.key, entry?.name) ===
+                      normalizeKingdomCreationChoice(section.key, section.selected);
+                    const details = [
+                      ...(entry?.abilityBoosts || []).map((item) => `Boost ${item}`),
+                      entry?.abilityFlaw && entry.abilityFlaw !== "None" ? `Flaw ${entry.abilityFlaw}` : entry?.abilityFlaw === "None" ? "No ability flaw" : "",
+                      ...(entry?.trainedSkills || []).map((item) => `Train ${item}`),
+                      entry?.bonusFeat ? `Bonus feat ${entry.bonusFeat}` : ""
+                    ].filter(Boolean);
+                    return `
+                      <article class="entry kingdom-choice-card ${active ? "is-selected" : ""}">
+                        <div class="entry-head">
+                          <span class="entry-title">${escapeHtml(entry?.name || "Option")}</span>
+                          ${active ? `<span class="entry-meta">Selected</span>` : ""}
+                        </div>
+                        <p>${escapeHtml(entry?.summary || "")}</p>
+                        ${details.length ? `<p class="small">${escapeHtml(details.join(" • "))}</p>` : ""}
+                        <div class="toolbar kingdom-choice-card-toolbar">
+                          <button
+                            class="btn btn-secondary"
+                            type="button"
+                            data-action="kingdom-use-creation-choice"
+                            data-section="${escapeHtml(section.key)}"
+                            data-value="${escapeHtml(entry?.name || "")}"
+                          >
+                            ${active ? "Using This Option" : "Use This"}
+                          </button>
+                        </div>
+                      </article>
+                    `;
+                  })
+                  .join("")}
+              </div>
+            </article>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function renderKingdomGuide(profile, kingdom) {
   const pcLeaders = (kingdom?.leaders || []).filter((leader) => str(leader?.type).toUpperCase() === "PC").length;
   const npcLeaders = Math.max(0, (kingdom?.leaders || []).length - pcLeaders);
@@ -3035,6 +5187,10 @@ function renderKingdomGuide(profile, kingdom) {
       `
     ),
     renderKingdomGuideSection("Kingdom Creation", renderKingdomGuideList(profile?.creationChanges || [])),
+    renderKingdomGuideSection(
+      "Charter / Government / Heartland Reference",
+      `<div data-kingdom-creation-reference>${renderKingdomCreationReference(profile, kingdom)}</div>`
+    ),
     renderKingdomGuideSection("Math And Scaling", renderKingdomGuideList(profile?.mathAdjustments || [])),
     renderKingdomGuideSection("Leadership Rules", renderKingdomGuideList(profile?.leadershipRules || [])),
     renderKingdomGuideSection(
@@ -3119,11 +5275,14 @@ function renderKingdomGuideList(items, options = {}) {
 }
 
 function renderKingdomLeaderEntry(leader) {
+  const active = isActiveKingdomLeader(leader);
   return `
     <article class="entry">
       <div class="entry-head">
         <span class="entry-title">${escapeHtml(leader.name || "Unnamed leader")}</span>
-        <span class="entry-meta">${escapeHtml(leader.role || "Role")} • ${escapeHtml(leader.type || "NPC")} • +${escapeHtml(String(leader.leadershipBonus || 0))}</span>
+        <span class="entry-meta">${escapeHtml(leader.role || "Role")} • ${escapeHtml(leader.type || "NPC")} • +${escapeHtml(String(leader.leadershipBonus || 0))} • ${
+          active ? "active" : "vacant"
+        }</span>
       </div>
       <div class="row">
         <label>Role
@@ -3160,11 +5319,14 @@ function renderKingdomLeaderEntry(leader) {
 }
 
 function renderKingdomSettlementEntry(settlement) {
+  const settlementActions = getSettlementActionCount(settlement);
   return `
     <article class="entry">
       <div class="entry-head">
         <span class="entry-title">${escapeHtml(settlement.name || "Unnamed settlement")}</span>
-        <span class="entry-meta">${escapeHtml(settlement.size || "Settlement")} • influence ${escapeHtml(String(settlement.influence || 0))}</span>
+        <span class="entry-meta">${escapeHtml(settlement.size || "Settlement")} • influence ${escapeHtml(String(settlement.influence || 0))} • ${
+          settlementActions ? `${settlementActions} settlement action${settlementActions === 1 ? "" : "s"}` : "no civic actions"
+        }</span>
       </div>
       <div class="row">
         <label>Name
@@ -3270,6 +5432,1052 @@ function renderKingdomTurnEntry(turn) {
         <button class="btn btn-danger" data-action="delete" data-collection="kingdomTurns" data-id="${turn.id}">Delete Turn</button>
       </div>
     </article>
+  `;
+}
+
+function renderHexMap() {
+  const hexMap = getHexMapState();
+  const selectedHex = getHexMapSelectedHex(hexMap);
+  const region = getKingdomRegionByHex(selectedHex);
+  const markers = getHexMapMarkersForHex(selectedHex);
+  const forces = getHexMapForcesForHex(selectedHex);
+  const party = getHexMapParty(hexMap);
+  const linkedLocations = getHexLinkedLocations(selectedHex);
+  const view = getHexMapViewBox(hexMap);
+  const metrics = getHexMapMetrics(hexMap);
+  const backgroundPlacement = hexMap.backgroundUrl ? getHexMapBackgroundPlacement(hexMap) : null;
+
+  return `
+    <div class="page-stack hexmap-page">
+      ${renderPageIntro("Hex Map", "Lay out claimed hexes, building sites, encounters, and future kingdom events in one visual board.")}
+      <section class="panel flow-panel">
+        <h2>How To Use This Map</h2>
+        <ol class="flow-list">
+          <li><strong>Step 1:</strong> optionally load your own Stolen Lands image as a background.</li>
+          <li><strong>Step 2:</strong> click any hex to inspect it and save kingdom-region details.</li>
+          <li><strong>Step 3:</strong> pin encounters, buildings, settlements, or events as map markers.</li>
+        </ol>
+        ${ui.hexMapMessage ? `<p class="small">${escapeHtml(ui.hexMapMessage)}</p>` : ""}
+      </section>
+
+      <section class="hexmap-layout">
+        <article class="panel hexmap-board-panel">
+          <div class="entry-head">
+            <div>
+              <h2 style="margin:0;">${escapeHtml(hexMap.mapName || "Hex Map")}</h2>
+              <p class="small" style="margin:6px 0 0;">${escapeHtml(
+                `${metrics.columns} columns • ${metrics.rows} rows • hex size ${metrics.size}px • selected ${selectedHex}`
+              )}</p>
+            </div>
+            <div class="hexmap-chip-row">
+              <span class="chip">${escapeHtml(String(getKingdomState().regions.length))} tracked regions</span>
+              <span class="chip">${escapeHtml(String(hexMap.markers.length))} markers</span>
+              <span class="chip">${escapeHtml(String(hexMap.forces.length || 0))} force markers</span>
+              <span class="chip">${escapeHtml(party.hex ? `${party.label} at ${party.hex}` : "Party marker not placed")}</span>
+              <span class="chip ${hexMap.partyMoveMode ? "chip-accent" : ""}">${escapeHtml(hexMap.partyMoveMode ? "Party Move Mode: On" : "Party Move Mode: Off")}</span>
+              <span class="chip" data-hexmap-zoom-chip>Zoom ${escapeHtml(`${Math.round(hexMap.zoom * 100)}%`)}</span>
+            </div>
+          </div>
+
+          <form class="hexmap-settings-grid" data-form="hexmap-settings">
+            <label>Map Name
+              <input name="mapName" value="${escapeHtml(hexMap.mapName || "")}" placeholder="Stolen Lands Hex Planner" />
+            </label>
+            <label>Columns
+              <input name="columns" type="number" min="${HEX_MAP_COLUMNS_MIN}" max="${HEX_MAP_COLUMNS_MAX}" value="${escapeHtml(String(hexMap.columns))}" />
+            </label>
+            <label>Rows
+              <input name="rows" type="number" min="${HEX_MAP_ROWS_MIN}" max="${HEX_MAP_ROWS_MAX}" value="${escapeHtml(String(hexMap.rows))}" />
+            </label>
+            <label>Hex Size
+              <input name="hexSize" type="number" min="${HEX_MAP_HEX_SIZE_MIN}" max="${HEX_MAP_HEX_SIZE_MAX}" value="${escapeHtml(String(hexMap.hexSize))}" />
+            </label>
+            <label>Background Opacity
+              <input name="backgroundOpacity" type="number" min="0" max="0.95" step="0.05" value="${escapeHtml(String(hexMap.backgroundOpacity))}" />
+            </label>
+            <label>Background Scale
+              <input name="backgroundScale" type="number" min="${HEX_MAP_BACKGROUND_SCALE_MIN}" max="${HEX_MAP_BACKGROUND_SCALE_MAX}" step="0.05" value="${escapeHtml(String(hexMap.backgroundScale))}" />
+            </label>
+            <label>Background Offset X
+              <input name="backgroundOffsetX" type="number" step="10" value="${escapeHtml(String(hexMap.backgroundOffsetX))}" />
+            </label>
+            <label>Background Offset Y
+              <input name="backgroundOffsetY" type="number" step="10" value="${escapeHtml(String(hexMap.backgroundOffsetY))}" />
+            </label>
+            <label>Grid Fill Opacity
+              <input name="gridFillOpacity" type="number" min="0" max="0.65" step="0.05" value="${escapeHtml(String(hexMap.gridFillOpacity))}" />
+            </label>
+            <label>Grid Line Opacity
+              <input name="gridLineOpacity" type="number" min="0.15" max="1" step="0.05" value="${escapeHtml(String(hexMap.gridLineOpacity))}" />
+            </label>
+            <label>Show Labels
+              <select name="showLabels">
+                <option value="true" ${hexMap.showLabels ? "selected" : ""}>On</option>
+                <option value="false" ${hexMap.showLabels ? "" : "selected"}>Off</option>
+              </select>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Save Map Settings</button>
+            </div>
+          </form>
+
+          <div class="toolbar hexmap-toolbar">
+            <button class="btn btn-secondary" type="button" data-action="hexmap-choose-background">Choose Background</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-clear-background" ${hexMap.backgroundUrl ? "" : "disabled"}>Clear Background</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-fit-background" ${hexMap.backgroundUrl ? "" : "disabled"}>Recenter Background</button>
+            <button class="btn ${hexMap.partyMoveMode ? "btn-primary" : "btn-secondary"}" type="button" data-action="hexmap-toggle-party-move">${hexMap.partyMoveMode ? "Party Move Mode On" : "Party Move Mode Off"}</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-zoom-out">Zoom Out</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-zoom-in">Zoom In</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-reset-view">Reset View</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-pan" data-direction="left">Pan Left</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-pan" data-direction="right">Pan Right</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-pan" data-direction="up">Pan Up</button>
+            <button class="btn btn-secondary" type="button" data-action="hexmap-pan" data-direction="down">Pan Down</button>
+          </div>
+          <p class="small">Background: ${escapeHtml(
+            hexMap.backgroundName || "None loaded. Bring your own local Stolen Lands image when ready."
+          )}</p>
+          ${
+            backgroundPlacement
+              ? `<p class="small">Map image ${escapeHtml(
+                  `${Math.round(backgroundPlacement.naturalWidth)}x${Math.round(backgroundPlacement.naturalHeight)} px`
+                )}. Use scale and offsets until the overlay hexes sit on the printed hex centers.</p>`
+              : `<p class="small">Tip: save the Stolen Lands map to disk, click <strong>Choose Background</strong>, then line it up with the overlay using the scale and offset controls.</p>`
+          }
+
+          <div class="hexmap-stage-shell" data-hexmap-stage-shell="true">
+            <svg
+              class="hexmap-stage"
+              data-hexmap-stage="true"
+              viewBox="${escapeHtml(`${view.x.toFixed(2)} ${view.y.toFixed(2)} ${view.width.toFixed(2)} ${view.height.toFixed(2)}`)}"
+              xmlns="http://www.w3.org/2000/svg"
+              role="img"
+              aria-label="Interactive kingdom hex map"
+            >
+              <rect x="0" y="0" width="${escapeHtml(String(view.boardWidth.toFixed(2)))}" height="${escapeHtml(String(view.boardHeight.toFixed(2)))}" fill="#f7f1e5" />
+              ${
+                hexMap.backgroundUrl && backgroundPlacement
+                  ? `<image
+                      href="${escapeHtml(hexMap.backgroundUrl)}"
+                      x="${escapeHtml(String(backgroundPlacement.x.toFixed(2)))}"
+                      y="${escapeHtml(String(backgroundPlacement.y.toFixed(2)))}"
+                      width="${escapeHtml(String(backgroundPlacement.width.toFixed(2)))}"
+                      height="${escapeHtml(String(backgroundPlacement.height.toFixed(2)))}"
+                      preserveAspectRatio="none"
+                      opacity="${escapeHtml(String(hexMap.backgroundOpacity))}"
+                    />`
+                  : ""
+              }
+              ${renderHexMapPartyTrail(hexMap)}
+              ${renderHexMapSvgCells(hexMap, selectedHex)}
+            </svg>
+          </div>
+
+          <div class="hexmap-legend-grid">
+            <article class="entry">
+              <div class="entry-head">
+                <span class="entry-title">Hex Status Colors</span>
+              </div>
+              <div class="hexmap-legend-row">
+                ${HEX_MAP_STATUS_OPTIONS.map(
+                  (status) => `
+                    <span class="hexmap-legend-chip">
+                      <span class="hexmap-legend-swatch" style="background:${escapeHtml(getHexStatusColor(status))};"></span>
+                      ${escapeHtml(status)}
+                    </span>
+                  `
+                ).join("")}
+              </div>
+            </article>
+            <article class="entry">
+              <div class="entry-head">
+                <span class="entry-title">Marker Types</span>
+              </div>
+              <div class="hexmap-legend-row">
+                <span class="hexmap-legend-chip">
+                  <span class="hexmap-party-dot">P</span>
+                  Party
+                </span>
+                ${HEX_MAP_MARKER_TYPES.map(
+                  (type) => `
+                    <span class="hexmap-legend-chip">
+                      <span class="hexmap-marker-dot" style="background:${escapeHtml(getHexMarkerColor(type))};"></span>
+                      ${escapeHtml(type)}
+                    </span>
+                  `
+                ).join("")}
+              </div>
+            </article>
+            <article class="entry">
+              <div class="entry-head">
+                <span class="entry-title">Force Types</span>
+              </div>
+              <div class="hexmap-legend-row">
+                ${HEX_MAP_FORCE_TYPES.map(
+                  (type) => `
+                    <span class="hexmap-legend-chip">
+                      <span class="hexmap-party-dot" style="background:${escapeHtml(getHexForceColor(type))};">${escapeHtml(getHexForceGlyph(type))}</span>
+                      ${escapeHtml(type)}
+                    </span>
+                  `
+                ).join("")}
+              </div>
+            </article>
+          </div>
+        </article>
+
+        <aside class="panel hexmap-inspector">
+          <div class="entry-head">
+            <span class="entry-title">Selected Hex ${escapeHtml(selectedHex)}</span>
+            <span class="entry-meta">${escapeHtml(region?.status || "No region record yet")}</span>
+          </div>
+
+          <div class="hexmap-summary-grid">
+            <article class="entry">
+              <div class="entry-head"><span class="entry-title">Terrain</span></div>
+              <p>${escapeHtml(region?.terrain || "Not set")}</p>
+            </article>
+            <article class="entry">
+              <div class="entry-head"><span class="entry-title">Work Site</span></div>
+              <p>${escapeHtml(region?.workSite || "None")}</p>
+            </article>
+            <article class="entry">
+              <div class="entry-head"><span class="entry-title">Markers</span></div>
+              <p>${escapeHtml(String(markers.length))}</p>
+            </article>
+            <article class="entry">
+              <div class="entry-head"><span class="entry-title">Forces</span></div>
+              <p>${escapeHtml(String(forces.length))}</p>
+            </article>
+            <article class="entry">
+              <div class="entry-head"><span class="entry-title">Party</span></div>
+              <p>${escapeHtml(party.hex ? `${party.label} at ${party.hex}` : "Not placed")}</p>
+            </article>
+            <article class="entry">
+              <div class="entry-head"><span class="entry-title">Locations</span></div>
+              <p>${escapeHtml(String(linkedLocations.length))}</p>
+            </article>
+          </div>
+
+          <form data-form="hexmap-region">
+            <input type="hidden" name="hex" value="${escapeHtml(selectedHex)}" />
+            <div class="row">
+              <label>Hex
+                <input name="hexReadOnly" value="${escapeHtml(selectedHex)}" readonly />
+              </label>
+              <label>Status
+                <select name="status">
+                  ${HEX_MAP_STATUS_OPTIONS.map((status) => `<option value="${escapeHtml(status)}" ${str(region?.status) === status ? "selected" : ""}>${escapeHtml(status)}</option>`).join("")}
+                </select>
+              </label>
+            </div>
+            <div class="row">
+              <label>Terrain
+                <input name="terrain" list="hexmap-terrain-options" value="${escapeHtml(region?.terrain || "")}" placeholder="Forest" />
+              </label>
+              <label>Work Site
+                <input name="workSite" value="${escapeHtml(region?.workSite || "")}" placeholder="Lumber Camp" />
+              </label>
+            </div>
+            <label>Hex Notes
+              <textarea name="notes" placeholder="Why this hex matters, what lives here, and what changes next.">${escapeHtml(region?.notes || "")}</textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Save Hex Record</button>
+              <button class="btn btn-danger" type="button" data-action="hexmap-clear-region" ${region ? "" : "disabled"}>Clear Hex Record</button>
+            </div>
+          </form>
+
+          <form data-form="hexmap-marker">
+            <input type="hidden" name="hex" value="${escapeHtml(selectedHex)}" />
+            <div class="row">
+              <label>Marker Type
+                <select name="type">
+                  ${HEX_MAP_MARKER_TYPES.map((type) => `<option value="${escapeHtml(type)}">${escapeHtml(type)}</option>`).join("")}
+                </select>
+              </label>
+              <label>Marker Title
+                <input name="title" placeholder="Bandit scouting camp" />
+              </label>
+            </div>
+            <label>Marker Notes
+              <textarea name="notes" placeholder="What happens here, what clue is present, what escalates if ignored."></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Add Marker</button>
+            </div>
+          </form>
+
+          <form data-form="hexmap-party">
+            <input type="hidden" name="hex" value="${escapeHtml(selectedHex)}" />
+            <div class="entry-head">
+              <span class="entry-title">Party Tracker</span>
+              <span class="entry-meta">${escapeHtml(party.hex || "Not placed")}</span>
+            </div>
+            <div class="row">
+              <label>Party Label
+                <input name="label" value="${escapeHtml(party.label || "Party")}" placeholder="Party" />
+              </label>
+              <label>Current Party Hex
+                <input value="${escapeHtml(party.hex || "Not placed")}" readonly />
+              </label>
+            </div>
+            <label>Party Notes
+              <textarea name="notes" placeholder="What they are doing here, current objective, who they are traveling with.">${escapeHtml(party.notes || "")}</textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Move Party To ${escapeHtml(selectedHex)}</button>
+              <button class="btn btn-secondary" type="button" data-action="hexmap-center-party" ${party.hex ? "" : "disabled"}>Center On Party</button>
+              <button class="btn btn-secondary" type="button" data-action="hexmap-toggle-party-move">${hexMap.partyMoveMode ? "Stop Click-Move" : "Enable Click-Move"}</button>
+              <button class="btn btn-secondary" type="button" data-action="hexmap-clear-party-trail" ${party.trail.length > 1 ? "" : "disabled"}>Clear Trail</button>
+              <button class="btn btn-danger" type="button" data-action="hexmap-clear-party" ${party.hex ? "" : "disabled"}>Clear Party Marker</button>
+            </div>
+          </form>
+
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Recent Party Route</span>
+              <span class="entry-meta">${escapeHtml(String(party.trail.length))} points</span>
+            </div>
+            ${
+              party.trail.length
+                ? `<ul class="flow-list">${party.trail
+                    .slice(0, 10)
+                    .map((entry, index) => `<li><strong>${escapeHtml(entry.hex)}</strong>${index === 0 ? " (current/latest)" : ""}${entry.at ? ` • ${escapeHtml(formatTimestamp(entry.at))}` : ""}</li>`)
+                    .join("")}</ul>`
+                : `<p class="small">No party travel history yet.</p>`
+            }
+          </article>
+
+          <form data-form="hexmap-force">
+            <input type="hidden" name="hex" value="${escapeHtml(selectedHex)}" />
+            <div class="entry-head">
+              <span class="entry-title">Force Marker</span>
+              <span class="entry-meta">${escapeHtml(selectedHex)}</span>
+            </div>
+            <div class="row">
+              <label>Force Type
+                <select name="type">
+                  ${HEX_MAP_FORCE_TYPES.map((type) => `<option value="${escapeHtml(type)}">${escapeHtml(type)}</option>`).join("")}
+                </select>
+              </label>
+              <label>Force Name
+                <input name="name" placeholder="South Road Caravan" />
+              </label>
+            </div>
+            <label>Force Notes
+              <textarea name="notes" placeholder="Strength, destination, commander, threat level, current goal."></textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Add Force</button>
+            </div>
+          </form>
+
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Markers In ${escapeHtml(selectedHex)}</span>
+            </div>
+            <div class="card-list">
+              ${markers.length ? markers.map((marker) => renderHexMapMarkerEntry(marker)).join("") : `<p class="empty">No markers in this hex yet.</p>`}
+            </div>
+          </article>
+
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Forces In ${escapeHtml(selectedHex)}</span>
+            </div>
+            <div class="card-list">
+              ${forces.length ? forces.map((force) => renderHexMapForceEntry(force)).join("") : `<p class="empty">No force markers in this hex yet.</p>`}
+            </div>
+          </article>
+
+          <article class="entry">
+            <div class="entry-head">
+              <span class="entry-title">Linked Locations</span>
+            </div>
+            ${
+              linkedLocations.length
+                ? `<ul class="flow-list">${linkedLocations
+                    .map((location) => `<li><strong>${escapeHtml(location.name || "Unnamed Location")}</strong>${location.whatChanged ? `: ${escapeHtml(location.whatChanged)}` : ""}</li>`)
+                    .join("")}</ul>`
+                : `<p class="small">No location records currently use ${escapeHtml(selectedHex)}.</p>`
+            }
+          </article>
+        </aside>
+      </section>
+      <datalist id="hexmap-terrain-options">
+        ${HEX_MAP_TERRAIN_OPTIONS.map((terrain) => `<option value="${escapeHtml(terrain)}"></option>`).join("")}
+      </datalist>
+    </div>
+  `;
+}
+
+function renderHexMapSvgCells(hexMap, selectedHex) {
+  const metrics = getHexMapMetrics(hexMap);
+  const selected = normalizeHexCoordinate(selectedHex, hexMap.columns, hexMap.rows);
+  const party = getHexMapParty(hexMap);
+  const cells = [];
+  for (let col = 0; col < metrics.columns; col += 1) {
+    for (let row = 0; row < metrics.rows; row += 1) {
+      const hex = `${getHexColumnLabel(col)}${row + 1}`;
+      const center = getHexCenter(col, row, hexMap);
+      const region = getKingdomRegionByHex(hex);
+      const markers = getHexMapMarkersForHex(hex);
+      const forces = getHexMapForcesForHex(hex);
+      const isPartyHex = party.hex === hex;
+      const markerOffsetBase = center.cx - (Math.max(0, markers.length - 1) * 9) / 2;
+      const forceOffsetBase = center.cx - (Math.max(0, forces.length - 1) * 14) / 2;
+      cells.push(`
+        <g class="hexmap-cell-group ${hex === selected ? "is-selected" : ""}">
+          <polygon
+            class="hexmap-cell ${hex === selected ? "is-selected" : ""}"
+            data-action="hexmap-select-hex"
+            data-hex="${escapeHtml(hex)}"
+            points="${escapeHtml(buildHexPolygonPoints(center.cx, center.cy, metrics.size))}"
+            fill="${escapeHtml(getHexStatusColor(region?.status || ""))}"
+            style="--hex-fill-opacity:${escapeHtml(String(hexMap.gridFillOpacity))}; --hex-stroke:rgba(77, 58, 29, ${escapeHtml(String(hexMap.gridLineOpacity))});"
+          >
+            <title>${escapeHtml(`${hex} • ${region?.status || "Unclaimed"}${region?.terrain ? ` • ${region.terrain}` : ""}`)}</title>
+          </polygon>
+          ${
+            hexMap.showLabels
+              ? `<text x="${escapeHtml(String(center.cx.toFixed(2)))}" y="${escapeHtml(String((center.cy - 4).toFixed(2)))}" class="hexmap-label">${escapeHtml(hex)}</text>`
+              : ""
+          }
+          ${
+            region?.workSite
+              ? `<text x="${escapeHtml(String(center.cx.toFixed(2)))}" y="${escapeHtml(String((center.cy + 15).toFixed(2)))}" class="hexmap-sub-label">${escapeHtml(region.workSite)}</text>`
+              : ""
+          }
+          ${
+            isPartyHex
+              ? `
+                <g data-action="hexmap-select-hex" data-hex="${escapeHtml(hex)}" class="hexmap-party-group">
+                  <circle
+                    cx="${escapeHtml(String(center.cx.toFixed(2)))}"
+                    cy="${escapeHtml(String((center.cy - metrics.size * 0.5).toFixed(2)))}"
+                    r="13"
+                    class="hexmap-party-marker"
+                  >
+                    <title>${escapeHtml(`${party.label || "Party"}: ${hex}`)}</title>
+                  </circle>
+                  <text
+                    x="${escapeHtml(String(center.cx.toFixed(2)))}"
+                    y="${escapeHtml(String((center.cy - metrics.size * 0.5 + 4).toFixed(2)))}"
+                    class="hexmap-party-label"
+                  >P</text>
+                </g>
+              `
+              : ""
+          }
+          ${forces
+            .slice(0, 3)
+            .map(
+              (force, index) => `
+                <g data-action="hexmap-select-hex" data-hex="${escapeHtml(hex)}" class="hexmap-force-group">
+                  <rect
+                    x="${escapeHtml(String((forceOffsetBase + index * 28 - 11).toFixed(2)))}"
+                    y="${escapeHtml(String((center.cy - metrics.size * 0.1 - 11).toFixed(2)))}"
+                    width="22"
+                    height="22"
+                    rx="7"
+                    fill="${escapeHtml(getHexForceColor(force.type))}"
+                    class="hexmap-force-marker"
+                  >
+                    <title>${escapeHtml(`${force.type}: ${force.name || "Unnamed force"}`)}</title>
+                  </rect>
+                  <text
+                    x="${escapeHtml(String((forceOffsetBase + index * 28).toFixed(2)))}"
+                    y="${escapeHtml(String((center.cy - metrics.size * 0.1 + 4).toFixed(2)))}"
+                    class="hexmap-force-label"
+                  >${escapeHtml(getHexForceGlyph(force.type))}</text>
+                </g>
+              `
+            )
+            .join("")}
+          ${markers
+            .slice(0, 4)
+            .map(
+              (marker, index) => `
+                <g data-action="hexmap-select-hex" data-hex="${escapeHtml(hex)}" class="hexmap-marker-group">
+                  <circle
+                    cx="${escapeHtml(String((markerOffsetBase + index * 18).toFixed(2)))}"
+                    cy="${escapeHtml(String((center.cy + metrics.size * 0.55).toFixed(2)))}"
+                    r="7"
+                    fill="${escapeHtml(getHexMarkerColor(marker.type))}"
+                    class="hexmap-marker-svg"
+                  >
+                    <title>${escapeHtml(`${marker.type}: ${marker.title || "Untitled marker"}`)}</title>
+                  </circle>
+                </g>
+              `
+            )
+            .join("")}
+        </g>
+      `);
+    }
+  }
+  return cells.join("");
+}
+
+function renderHexMapPartyTrail(hexMap) {
+  const party = getHexMapParty(hexMap);
+  const trail = Array.isArray(party.trail) ? party.trail.slice(0, 12) : [];
+  if (!trail.length) return "";
+  const ordered = [...trail].reverse();
+  const points = ordered
+    .map((entry) => {
+      const parsed = parseHexCoordinate(entry.hex);
+      if (!parsed) return null;
+      const center = getHexCenter(parsed.columnIndex, parsed.rowIndex, hexMap);
+      return center;
+    })
+    .filter(Boolean);
+  if (!points.length) return "";
+  const polyline = points.length > 1
+    ? `<polyline class="hexmap-party-trail-line" points="${escapeHtml(points.map((point) => `${point.cx.toFixed(2)},${point.cy.toFixed(2)}`).join(" "))}" />`
+    : "";
+  const dots = points
+    .map(
+      (point, index) => `
+        <circle
+          class="hexmap-party-trail-dot ${index === points.length - 1 ? "is-current" : ""}"
+          cx="${escapeHtml(String(point.cx.toFixed(2)))}"
+          cy="${escapeHtml(String(point.cy.toFixed(2)))}"
+          r="${index === points.length - 1 ? "6" : "4"}"
+        />
+      `
+    )
+    .join("");
+  return `<g class="hexmap-party-trail-layer">${polyline}${dots}</g>`;
+}
+
+function renderHexMapMarkerEntry(marker) {
+  return `
+    <article class="entry">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(marker.title || "Untitled marker")}</span>
+        <span class="entry-meta">${escapeHtml(marker.type || "Note")} • ${escapeHtml(marker.hex || "")}</span>
+      </div>
+      <div class="row">
+        <label>Type
+          <select data-collection="hexMapMarkers" data-id="${marker.id}" data-field="type">
+            ${HEX_MAP_MARKER_TYPES.map((type) => `<option value="${escapeHtml(type)}" ${marker.type === type ? "selected" : ""}>${escapeHtml(type)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Title
+          <input data-collection="hexMapMarkers" data-id="${marker.id}" data-field="title" value="${escapeHtml(marker.title || "")}" />
+        </label>
+      </div>
+      <label>Notes
+        <textarea data-collection="hexMapMarkers" data-id="${marker.id}" data-field="notes">${escapeHtml(marker.notes || "")}</textarea>
+      </label>
+      <div class="toolbar">
+        <button class="btn btn-danger" data-action="delete" data-collection="hexMapMarkers" data-id="${marker.id}">Delete Marker</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderHexMapForceEntry(force) {
+  return `
+    <article class="entry">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(force.name || "Unnamed force")}</span>
+        <span class="entry-meta">${escapeHtml(force.type || "Allied Force")} • ${escapeHtml(force.hex || "")}</span>
+      </div>
+      <div class="row">
+        <label>Type
+          <select data-collection="hexMapForces" data-id="${force.id}" data-field="type">
+            ${HEX_MAP_FORCE_TYPES.map((type) => `<option value="${escapeHtml(type)}" ${force.type === type ? "selected" : ""}>${escapeHtml(type)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Name
+          <input data-collection="hexMapForces" data-id="${force.id}" data-field="name" value="${escapeHtml(force.name || "")}" />
+        </label>
+      </div>
+      <label>Notes
+        <textarea data-collection="hexMapForces" data-id="${force.id}" data-field="notes">${escapeHtml(force.notes || "")}</textarea>
+      </label>
+      <div class="toolbar">
+        <button class="btn btn-danger" data-action="delete" data-collection="hexMapForces" data-id="${force.id}">Delete Force</button>
+      </div>
+    </article>
+  `;
+}
+
+function normalizeRulesSearchQuery(value) {
+  return str(value).replace(/\s+/g, " ").trim();
+}
+
+function getRulesSearchTerms(value) {
+  return extractRetrievalTerms(normalizeRulesSearchQuery(value)).slice(0, 12);
+}
+
+function scoreRulesTitleMatch(query, result) {
+  const cleanQuery = normalizeRulesSearchQuery(query).toLowerCase();
+  if (!cleanQuery) return 0;
+  const title = str(result?.title).toLowerCase();
+  const pathValue = str(result?.path).toLowerCase();
+  const titleWords = cleanQuery.split(/\s+/).filter(Boolean);
+  let score = 0;
+  if (title === cleanQuery) score += 12;
+  if (title.startsWith(cleanQuery)) score += 8;
+  if (title.includes(cleanQuery)) score += 5;
+  if (pathValue.includes(cleanQuery)) score += 3;
+  if (titleWords.length && titleWords.every((word) => title.includes(word))) score += 4;
+  return score;
+}
+
+function sortRulesResults(query, results) {
+  return [...(Array.isArray(results) ? results : [])].sort((a, b) => {
+    const scoreA = Number(a?.score || 0) + scoreRulesTitleMatch(query, a);
+    const scoreB = Number(b?.score || 0) + scoreRulesTitleMatch(query, b);
+    return scoreB - scoreA || str(a?.title).localeCompare(str(b?.title));
+  });
+}
+
+function getRecentRuleCaptureEntries(limit = 8) {
+  return [...(state.liveCapture || [])]
+    .filter((entry) => {
+      const kind = str(entry?.kind).toLowerCase();
+      return kind === "rule" || kind === "retcon" || kind === "house rule";
+    })
+    .sort((a, b) => safeDate(b.timestamp) - safeDate(a.timestamp))
+    .slice(0, limit);
+}
+
+function extractRelevantRuleExcerpt(text, query, limit = 440) {
+  const source = str(text);
+  if (!source) return "";
+  const terms = getRulesSearchTerms(query);
+  if (!terms.length) return compactLine(source, limit);
+  const paragraphs = source
+    .replace(/\r/g, "")
+    .split(/\n{2,}/)
+    .map((item) => item.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (!paragraphs.length) return compactLine(source, limit);
+  const ranked = paragraphs
+    .map((paragraph, index) => ({
+      paragraph,
+      index,
+      score: countRetrievalTokenHits(paragraph.toLowerCase(), terms),
+    }))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  const chosen = ranked[0]?.score > 0 ? ranked[0].paragraph : paragraphs[0];
+  return compactLine(chosen, limit);
+}
+
+function buildRulesLocalMatches(query) {
+  const aiMemory = buildAiMemoryDigests(state);
+  state.meta.aiMemory = aiMemory;
+  const effectiveDigest = str(aiMemory.rulingsDigest);
+  const manualDigest = str(aiMemory.manualRulings);
+  const ruleEntries = getRecentRuleCaptureEntries(10);
+  const rulesStore = ensureRulesStore();
+  const terms = getRulesSearchTerms(query);
+
+  const digestMatches = [];
+  if (effectiveDigest) {
+    const digestText = extractRelevantRuleExcerpt(effectiveDigest, query, 520);
+    const digestScore = terms.length ? countRetrievalTokenHits(digestText.toLowerCase(), terms) : 1;
+    if (digestScore > 0 || !terms.length) {
+      digestMatches.push({
+        kind: manualDigest ? "Manual digest" : "Effective digest",
+        title: manualDigest ? "Manual House Rules Digest" : "Derived Rulings Digest",
+        text: digestText,
+        score: digestScore,
+      });
+    }
+  }
+
+  const entryMatches = ruleEntries
+    .map((entry) => {
+      const note = str(entry.note);
+      const score = terms.length ? countRetrievalTokenHits(note.toLowerCase(), terms) : 1;
+      return {
+        id: entry.id,
+        kind: str(entry.kind) || "Rule",
+        title: `${entry.kind || "Rule"} • ${formatAiHistoryTimestamp(entry.timestamp) || "No timestamp"}`,
+        text: note,
+        score,
+      };
+    })
+    .filter((entry) => (terms.length ? entry.score > 0 : true))
+    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
+    .slice(0, 5);
+
+  const savedMatches = rulesStore
+    .map((entry) => {
+      const haystack = `${entry.title} ${entry.text} ${entry.tags.join(" ")}`.toLowerCase();
+      const score = terms.length ? countRetrievalTokenHits(haystack, terms) : 1;
+      return {
+        id: entry.id,
+        title: entry.title,
+        kind: entry.kind,
+        kindLabel: getRuleStoreKindLabel(entry.kind),
+        text: extractRelevantRuleExcerpt(entry.text, query, 520),
+        sourceTitle: entry.sourceTitle,
+        sourceUrl: entry.sourceUrl,
+        tags: Array.isArray(entry.tags) ? entry.tags : [],
+        updatedAt: entry.updatedAt || entry.createdAt || "",
+        score,
+      };
+    })
+    .filter((entry) => (terms.length ? entry.score > 0 : true))
+    .sort((a, b) => b.score - a.score || safeDate(b.updatedAt) - safeDate(a.updatedAt))
+    .slice(0, 8);
+
+  return {
+    aiMemory,
+    digestMatches,
+    entryMatches,
+    savedMatches,
+  };
+}
+
+function getSelectedRulesResult(results = ui.rulesResults) {
+  const selectedUrl = str(ui.rulesSelectedUrl);
+  const list = Array.isArray(results) ? results : [];
+  if (selectedUrl) {
+    const matched = list.find((result) => str(result?.url) === selectedUrl);
+    if (matched) return matched;
+  }
+  return list[0] || null;
+}
+
+function saveSelectedOfficialRuleToStore() {
+  const selected = getSelectedRulesResult(ui.rulesResults);
+  if (!selected) {
+    ui.rulesMessage = "Select an official rule first.";
+    render();
+    return;
+  }
+  const entry = upsertRulesStoreEntry({
+    title: str(selected.title || ui.rulesSearchQuery || "Official PF2e Rule"),
+    kind: "official_note",
+    text: str(selected.snippet || ""),
+    sourceTitle: str(selected.title || ""),
+    sourceUrl: str(selected.url || ""),
+    sourceOrigin: "official",
+    tags: buildRuleStoreTags({ title: str(selected.title || ""), text: str(selected.snippet || ""), kind: "official_note" }),
+  });
+  state.meta.aiMemory = buildAiMemoryDigests(state);
+  saveState();
+  ui.rulesMessage = `Saved official note: ${entry.title}.`;
+  render();
+}
+
+function saveCopilotOutputToRulesStore(kind = "accepted_ruling") {
+  const output = str(ui.copilotDraft.output);
+  if (!output) {
+    ui.copilotMessage = "No Loremaster output to save.";
+    render();
+    return;
+  }
+  const request = buildGlobalCopilotRequest(activeTab, ui.copilotDraft.input, false);
+  const selectedRule = activeTab === "rules" ? getSelectedRulesResult(ui.rulesResults) : null;
+  const titleBase = selectedRule?.title || ui.copilotDraft.input || request?.taskLabel || "Loremaster Note";
+  const entry = upsertRulesStoreEntry({
+    title: compactLine(titleBase, 140),
+    kind,
+    text: output,
+    sourceTitle: str(selectedRule?.title || request?.taskLabel || ""),
+    sourceUrl: str(selectedRule?.url || ""),
+    sourceOrigin: "loremaster",
+    tags: buildRuleStoreTags({ title: titleBase, text: output, kind }),
+  });
+  state.meta.aiMemory = buildAiMemoryDigests(state);
+  saveState();
+  ui.copilotMessage = `${getRuleStoreKindLabel(kind)} saved to the local rules/canon store.`;
+  render();
+}
+
+function buildRulesPromptFromResult(result, mode = "explain") {
+  const title = str(result?.title || "PF2e rule");
+  const url = str(result?.url || "");
+  const snippet = str(result?.snippet || "");
+  if (mode === "compare") {
+    return [
+      `Using the official Pathfinder 2e rule page "${title}", compare the official rule against my local rulings digest.`,
+      "Return:",
+      "Official Rule:",
+      "- 2 to 5 bullets",
+      "Local Override / House Rule:",
+      "- bullet",
+      "GM Quick Ruling:",
+      "- 2 to 4 bullets",
+      "Source Trail:",
+      `- ${title}${url ? ` (${url})` : ""}`,
+      "",
+      "Official excerpt:",
+      snippet,
+    ].join("\n");
+  }
+  return [
+    `Using the official Pathfinder 2e rule page "${title}", explain how this works at the table.`,
+    "Return:",
+    "Rules Answer:",
+    "- 3 to 6 concise bullets",
+    "Official vs Local Notes:",
+    "- Confirmed official rule",
+    "- Local override if one exists",
+    "Source Trail:",
+    `- ${title}${url ? ` (${url})` : ""}`,
+    "",
+    "Official excerpt:",
+    snippet,
+  ].join("\n");
+}
+
+function renderRulesResultCard(result, selected) {
+  if (!result) return "";
+  const title = str(result.title || "PF2e rule");
+  const url = str(result.url || "");
+  const pathValue = str(result.path || "");
+  return `
+    <article class="entry rules-result-card ${selected ? "selected" : ""}">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(title)}</span>
+        <span class="entry-meta">${escapeHtml(result.source || "Archives of Nethys")} • Score ${escapeHtml(String(result.score || 0))}</span>
+      </div>
+      <p>${escapeHtml(str(result.snippet || "No excerpt available."))}</p>
+      <p class="small mono">${escapeHtml(pathValue || url)}</p>
+      <div class="toolbar">
+        <button class="btn ${selected ? "btn-primary" : "btn-secondary"}" data-action="rules-select-result" data-url="${encodeURIComponent(url)}">Select</button>
+        <button class="btn btn-secondary" data-action="rules-open-result" data-url="${encodeURIComponent(url)}" ${url ? "" : "disabled"}>Open AoN</button>
+        <button class="btn btn-secondary" data-action="rules-use-result" data-url="${encodeURIComponent(url)}">Ask Loremaster</button>
+        <button class="btn btn-secondary" data-action="rules-compare-result" data-url="${encodeURIComponent(url)}">Compare Official vs Local</button>
+        <button class="btn btn-secondary" data-action="rules-save-result" data-url="${encodeURIComponent(url)}">Save Official Note</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderRulesStoreEntryCard(entry) {
+  if (!entry) return "";
+  const sourceUrl = str(entry.sourceUrl || "");
+  return `
+    <article class="entry rules-result-card">
+      <div class="entry-head">
+        <span class="entry-title">${escapeHtml(entry.title || "Saved entry")}</span>
+        <span class="entry-meta">${escapeHtml(entry.kindLabel || getRuleStoreKindLabel(entry.kind))}${entry.updatedAt ? ` • ${escapeHtml(formatAiHistoryTimestamp(entry.updatedAt) || "")}` : ""}</span>
+      </div>
+      <p>${escapeHtml(str(entry.text || ""))}</p>
+      ${entry.tags?.length ? `<p class="small">Tags: ${escapeHtml(entry.tags.join(", "))}</p>` : ""}
+      ${sourceUrl ? `<p class="small mono">${escapeHtml(sourceUrl)}</p>` : ""}
+      <div class="toolbar">
+        <button class="btn btn-secondary" data-action="rules-delete-store-entry" data-id="${encodeURIComponent(entry.id)}">Delete</button>
+        <button class="btn btn-secondary" data-action="rules-open-store-source" data-url="${encodeURIComponent(sourceUrl)}" ${sourceUrl ? "" : "disabled"}>Open Source</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderRules() {
+  const aiMemory = buildAiMemoryDigests(state);
+  state.meta.aiMemory = aiMemory;
+  const query = normalizeRulesSearchQuery(ui.rulesSearchQuery);
+  const officialResults = sortRulesResults(query, ui.rulesResults);
+  const selectedResult = getSelectedRulesResult(officialResults);
+  const localMatches = buildRulesLocalMatches(query);
+  const savedRulesCount = ensureRulesStore().length;
+  const scope = str(ui.rulesScope || "both") || "both";
+  const showOfficial = scope !== "local";
+  const showLocal = scope !== "official";
+  const desktopSearchReady = !!desktopApi?.searchAonRules;
+  const searchLabel = ui.rulesBusy ? "Searching..." : "Search Official Rules";
+
+  return `
+    <div class="page-stack">
+      ${renderPageIntro("PF2e Rules", "Look up official Pathfinder 2e rules from Archives of Nethys, compare them against your local rulings digest, and send a grounded rules question into Loremaster.")}
+
+      <section class="panel flow-panel">
+        <h2>Run Order</h2>
+        <ol class="flow-list">
+          <li><strong>Step 1:</strong> search the official rules index for the exact PF2e term you need.</li>
+          <li><strong>Step 2:</strong> review the local rulings / house-rules side of the split view.</li>
+          <li><strong>Step 3:</strong> use Loremaster to produce a table-ready ruling grounded in both.</li>
+        </ol>
+        <p class="small">AoN live lookup: ${desktopSearchReady ? "available" : "desktop bridge not available"}${ui.rulesIndexedAt ? ` • Last cached index ${escapeHtml(ui.rulesIndexedAt)}` : ""}</p>
+        ${ui.rulesMessage ? `<p class="small">${escapeHtml(ui.rulesMessage)}</p>` : ""}
+      </section>
+
+      <section class="grid grid-2">
+        <article class="panel">
+          <h2>Official Rules Search</h2>
+          <form data-form="rules-search">
+            <div class="row">
+              <label>Search Query
+                <input name="query" value="${escapeHtml(query)}" placeholder="bleed, concealed, persistent damage, aid, command an animal" />
+              </label>
+              <label>Result Limit
+                <select name="limit">
+                  ${[3, 5, 6].map((value) => `<option value="${value}" ${Number(ui.rulesSearchLimit) === value ? "selected" : ""}>${value}</option>`).join("")}
+                </select>
+              </label>
+              <label>View Scope
+                <select name="scope">
+                  <option value="both" ${scope === "both" ? "selected" : ""}>Official + Local</option>
+                  <option value="official" ${scope === "official" ? "selected" : ""}>Official Only</option>
+                  <option value="local" ${scope === "local" ? "selected" : ""}>Local Only</option>
+                </select>
+              </label>
+            </div>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit" ${desktopSearchReady ? "" : "disabled"}>${searchLabel}</button>
+              <button class="btn btn-secondary" type="button" data-action="rules-refresh-search" ${desktopSearchReady && query ? "" : "disabled"}>Force Refresh</button>
+              <button class="btn btn-secondary" type="button" data-action="rules-use-query" ${query ? "" : "disabled"}>Send Query To Loremaster</button>
+            </div>
+          </form>
+          <p class="small">Searches use exact-title bias first, then broader title/path scoring. This keeps PF2e terms like conditions, actions, and subsystems from drifting into fuzzy fantasy matches.</p>
+        </article>
+
+        <article class="panel">
+          <h2>House Rules / Rulings Digest</h2>
+          <form data-form="ai-memory-rulings">
+            <label>Manual Rulings Digest
+              <textarea name="manualRulings" placeholder="Example: Hero Point rerolls must be declared before new information is revealed. We use remaster terminology only.">${escapeHtml(
+                aiMemory.manualRulings || ""
+              )}</textarea>
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Save Rulings Digest</button>
+            </div>
+          </form>
+          <article class="memory-card" style="margin-top:12px;">
+            <h3>Effective Local Rules Context</h3>
+            <div class="memory-block">${renderMultilineText(aiMemory.rulingsDigest || "No local rulings digest yet.")}</div>
+          </article>
+        </article>
+      </section>
+
+      <section class="grid grid-2 rules-split">
+        <article class="panel">
+          <h2>Official Rules Matches</h2>
+          ${
+            showOfficial
+              ? officialResults.length
+                ? `<div class="rules-result-list">${officialResults
+                    .map((result) => renderRulesResultCard(result, str(result.url) === str(selectedResult?.url)))
+                    .join("")}</div>`
+                : `<p class="empty">No official rule matches yet. Search for a condition, action, subsystem, or rule term above.</p>`
+              : `<p class="small">Official matches hidden by the current scope filter.</p>`
+          }
+        </article>
+
+        <article class="panel">
+          <h2>Official vs Local Split</h2>
+          ${
+            showOfficial && selectedResult
+              ? `
+                <article class="memory-card">
+                  <h3>Selected Official Rule</h3>
+                  <p><strong>${escapeHtml(str(selectedResult.title))}</strong></p>
+                  <p class="small mono">${escapeHtml(str(selectedResult.url || selectedResult.path || ""))}</p>
+                  <div class="memory-block">${renderMultilineText(str(selectedResult.snippet || "No excerpt available."))}</div>
+                </article>
+              `
+              : `<article class="memory-card"><h3>Selected Official Rule</h3><div class="memory-block">${renderMultilineText("No official rule selected.")}</div></article>`
+          }
+
+          ${
+            showLocal
+              ? `
+                <article class="memory-card" style="margin-top:12px;">
+                  <h3>Local Matches</h3>
+                  ${
+                    localMatches.savedMatches.length || localMatches.digestMatches.length || localMatches.entryMatches.length
+                      ? `
+                        ${
+                          localMatches.savedMatches.length
+                            ? `
+                              <div class="rules-local-match">
+                                <p><strong>Saved Rules / Canon Store</strong></p>
+                                ${localMatches.savedMatches.map((entry) => renderRulesStoreEntryCard(entry)).join("")}
+                              </div>
+                            `
+                            : ""
+                        }
+                        ${localMatches.digestMatches
+                          .map(
+                            (match) => `
+                              <div class="rules-local-match">
+                                <p><strong>${escapeHtml(match.title)}</strong></p>
+                                <div class="memory-block">${renderMultilineText(match.text)}</div>
+                              </div>
+                            `
+                          )
+                          .join("")}
+                        ${localMatches.entryMatches
+                          .map(
+                            (entry) => `
+                              <div class="rules-local-match">
+                                <p><strong>${escapeHtml(entry.title)}</strong></p>
+                                <div class="memory-block">${renderMultilineText(entry.text)}</div>
+                              </div>
+                            `
+                          )
+                          .join("")}
+                      `
+                      : `<div class="memory-block">${renderMultilineText("No matching local rulings were found for the current query.")}</div>`
+                  }
+                </article>
+              `
+              : `<article class="memory-card" style="margin-top:12px;"><h3>Local Matches</h3><div class="memory-block">${renderMultilineText("Local rulings hidden by the current scope filter.")}</div></article>`
+          }
+        </article>
+      </section>
+
+      <section class="grid grid-2">
+        <article class="panel">
+          <h2>Manual Local Rule / Canon Entry</h2>
+          <form data-form="rules-store-entry">
+            <div class="row">
+              <label>Title
+                <input name="title" placeholder="Aid clarification, hero point policy, canon fact" value="${escapeHtml(query ? compactLine(query, 120) : "")}" />
+              </label>
+              <label>Type
+                <select name="kind">
+                  <option value="accepted_ruling">Accepted Ruling</option>
+                  <option value="house_rule">House Rule</option>
+                  <option value="canon_memory">Canon Memory</option>
+                  <option value="official_note">Official Note</option>
+                </select>
+              </label>
+            </div>
+            <label>Text
+              <textarea name="text" placeholder="Save a short canonical ruling, house rule, or campaign truth here."></textarea>
+            </label>
+            <label>Source URL (optional)
+              <input name="sourceUrl" placeholder="https://2e.aonprd.com/Rules.aspx?ID=..." />
+            </label>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Save Local Entry</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <h2>Persistent Rules & Canon Store</h2>
+          <p class="small">${escapeHtml(String(savedRulesCount))} saved entry${savedRulesCount === 1 ? "" : "ies"} that Loremaster can retrieve later.</p>
+          ${
+            savedRulesCount
+              ? `<div class="rules-result-list">${ensureRulesStore()
+                  .slice(0, 10)
+                  .map((entry) =>
+                    renderRulesStoreEntryCard({
+                      ...entry,
+                      kindLabel: getRuleStoreKindLabel(entry.kind),
+                    })
+                  )
+                  .join("")}</div>`
+              : `<p class="empty">No persistent rules or canon entries saved yet.</p>`
+          }
+        </article>
+      </section>
+    </div>
   `;
 }
 
@@ -4047,6 +7255,7 @@ function ensureAiConfig() {
     compactContext: true,
     autoRunTabs: true,
     usePdfContext: true,
+    useAonRules: true,
     aiProfile: "fast",
   };
   const current =
@@ -4065,6 +7274,7 @@ function ensureAiConfig() {
     compactContext: current.compactContext === false ? false : true,
     autoRunTabs: current.autoRunTabs === false ? false : true,
     usePdfContext: current.usePdfContext === false ? false : true,
+    useAonRules: current.useAonRules === false ? false : true,
     aiProfile: ["fast", "deep", "custom"].includes(str(current.aiProfile).toLowerCase())
       ? str(current.aiProfile).toLowerCase()
       : base.aiProfile,
@@ -4296,6 +7506,7 @@ function applyAiProfile(profile) {
     next.compactContext = true;
     next.autoRunTabs = false;
     next.usePdfContext = true;
+    next.useAonRules = true;
     next.aiProfile = "fast";
   } else {
     next.model = pickInstalledModelByPreference(
@@ -4314,6 +7525,7 @@ function applyAiProfile(profile) {
     next.compactContext = false;
     next.autoRunTabs = false;
     next.usePdfContext = true;
+    next.useAonRules = true;
     next.aiProfile = "deep";
   }
 
@@ -4364,11 +7576,14 @@ function getTabLabel(tabId) {
 function getGlobalCopilotPlaceholder(tabId) {
   if (tabId === "sessions") return "Ask for recap + next prep beats for the latest session.";
   if (tabId === "capture") return "Ask to transform live capture into clean session notes.";
+  if (tabId === "rules") return "Ask a PF2e rules question like: how does bleed work, what does concealed do, or compare official vs local rulings.";
   if (tabId === "kingdom") return "Ask for kingdom-turn help, action order, leader assignments, or settlement advice.";
+  if (tabId === "hexmap") return "Ask for hex encounters, work-site ideas, event seeds, or consequences for the selected hex.";
   if (tabId === "npcs") return "Describe an NPC concept and ask for table-ready details.";
   if (tabId === "quests") return "Describe a quest idea and ask for objective/stakes.";
   if (tabId === "locations") return "Describe a hex/location and ask for a usable scene brief.";
   if (tabId === "pdf") return "Ask for best PDF search queries for your next session.";
+  if (tabId === "obsidian") return "Ask for vault folder structures, note templates, or cleaner markdown organization.";
   if (tabId === "foundry") return "Ask for Foundry handoff checklist for this session.";
   if (tabId === "writing") return "Ask for rewrite help, stronger wording, and clean structure.";
   return "Ask a GM question or chat naturally (example: hello, help me prep tonight).";
@@ -4377,22 +7592,135 @@ function getGlobalCopilotPlaceholder(tabId) {
 function getGlobalCopilotApplyLabel(tabId) {
   if (tabId === "sessions") return "Apply to Latest Session";
   if (tabId === "capture") return "Add as Live Capture";
+  if (tabId === "rules") return "Attach to Latest Prep";
   if (tabId === "kingdom") return "Append Kingdom Notes";
+  if (tabId === "hexmap") return "Append to Selected Hex";
   if (tabId === "npcs") return "Create NPC(s)";
   if (tabId === "quests") return "Create Quest";
   if (tabId === "locations") return "Create Location";
   if (tabId === "pdf") return "Use as PDF Query";
+  if (tabId === "obsidian") return "No Direct Apply";
   if (tabId === "foundry") return "Attach Foundry Notes";
   if (tabId === "writing") return "Send to Writing Helper";
   return "Attach to Latest Prep";
 }
 
 function getGlobalCopilotMode(tabId) {
+  if (tabId === "rules") return "assistant";
   if (tabId === "npcs") return "npc";
   if (tabId === "quests") return "quest";
   if (tabId === "locations") return "location";
+  if (tabId === "hexmap") return "location";
   if (tabId === "sessions" || tabId === "capture" || tabId === "writing" || tabId === "kingdom") return "session";
   return "prep";
+}
+
+const COPILOT_TASK_META = Object.freeze({
+  general_prep: { label: "General Prep", saveTarget: "latest session prep", mode: "prep" },
+  rules_question: { label: "Rules Question", saveTarget: "answer only", mode: "assistant" },
+  campaign_lookup: { label: "Campaign Lookup", saveTarget: "answer only", mode: "assistant" },
+  session_summary: { label: "Session Summary", saveTarget: "latest session", mode: "session" },
+  note_update: { label: "Note Update", saveTarget: "review before apply", mode: "session" },
+  kingdom_helper: { label: "Kingdom Helper", saveTarget: "kingdom notes", mode: "session" },
+  map_helper: { label: "Hex Map Helper", saveTarget: "selected hex or map notes", mode: "location" },
+  pdf_lookup: { label: "PDF-Grounded Lookup", saveTarget: "pdf query or prep", mode: "prep" },
+  vault_workflow: { label: "Vault Workflow", saveTarget: "vault note or folder plan", mode: "prep" },
+  foundry_handoff: { label: "Foundry Handoff", saveTarget: "latest session prep", mode: "prep" },
+  writing_cleanup: { label: "Writing Cleanup", saveTarget: "writing helper output", mode: "session" },
+  small_talk: { label: "Small Talk", saveTarget: "none", mode: "assistant" },
+});
+
+function renderObsidian() {
+  const settings = ensureObsidianSettings();
+  const looksLikeVault = settings.looksLikeVault === true;
+  const syncFolderPreview = settings.vaultPath
+    ? `${settings.vaultPath}${settings.vaultPath.endsWith("\\") ? "" : "\\"}${settings.baseFolder || "DM Helper"}`
+    : "(choose a vault folder first)";
+  const syncLabel = ui.obsidianBusy ? "Syncing..." : "Sync To Vault";
+  const hasAiOutput = str(ui.copilotDraft.output).length > 0;
+  const writeLabel = ui.obsidianBusy ? "Writing..." : "Write Current AI Output To Vault";
+  const readScope = settings.readWholeVault ? "Whole vault" : "DM Helper folder only";
+
+  return `
+    <div class="page-stack">
+      ${renderPageIntro("Obsidian Vault", "Connect Loremaster to your local Obsidian vault. DM Helper can export campaign notes, pull compact vault context into AI prompts, and write current AI output back into a markdown note.")}
+
+      <section class="panel flow-panel">
+        <h2>How This Works</h2>
+        <ol class="flow-list">
+          <li><strong>Step 1:</strong> choose your Obsidian vault folder.</li>
+          <li><strong>Step 2:</strong> choose the DM Helper folder name that will be created inside the vault.</li>
+          <li><strong>Step 3:</strong> decide whether Loremaster should read the whole vault or only the DM Helper folder for AI context.</li>
+          <li><strong>Step 4:</strong> sync sessions, NPCs, quests, locations, kingdom notes, and hex map notes into markdown files, or write the current AI output back into a note.</li>
+        </ol>
+        <p class="small">Current vault: <span class="mono">${escapeHtml(settings.vaultPath || "Not set")}</span></p>
+        <p class="small">Sync folder: <span class="mono">${escapeHtml(syncFolderPreview)}</span></p>
+        <p class="small">Vault check: ${escapeHtml(
+          settings.vaultPath ? (looksLikeVault ? "Looks like a real Obsidian vault." : "Folder selected, but no .obsidian folder was detected yet.") : "No vault selected."
+        )}</p>
+        <p class="small">Last sync: ${escapeHtml(settings.lastSyncAt || "Never")} ${settings.lastSyncSummary ? `• ${escapeHtml(settings.lastSyncSummary)}` : ""}</p>
+        <p class="small">AI read scope: ${escapeHtml(readScope)} • Note limit ${escapeHtml(String(settings.aiContextNoteLimit))} • Character budget ${escapeHtml(String(settings.aiContextCharLimit))}</p>
+        <p class="small">Last AI note: ${escapeHtml(settings.lastAiNotePath || "Never written")} ${settings.lastAiNoteAt ? `• ${escapeHtml(settings.lastAiNoteAt)}` : ""}</p>
+        ${ui.obsidianMessage ? `<p class="small">${escapeHtml(ui.obsidianMessage)}</p>` : ""}
+      </section>
+
+      <section class="grid grid-2">
+        <article class="panel">
+          <h2>Vault Settings</h2>
+          <form data-form="obsidian-settings">
+            <label>Vault Folder
+              <input name="vaultPath" value="${escapeHtml(settings.vaultPath || "")}" placeholder="C:\\Users\\Chris Bender\\Documents\\Obsidian Vault" />
+            </label>
+            <label>DM Helper Folder Inside Vault
+              <input name="baseFolder" value="${escapeHtml(settings.baseFolder || "DM Helper")}" placeholder="DM Helper" />
+            </label>
+            <label>AI Note Folder Inside DM Helper Folder
+              <input name="aiWriteFolder" value="${escapeHtml(settings.aiWriteFolder || "AI Notes")}" placeholder="AI Notes" />
+            </label>
+            <label>
+              <input type="checkbox" name="useForAiContext" ${settings.useForAiContext ? "checked" : ""} />
+              Let Loremaster read vault notes for AI context
+            </label>
+            <label>
+              <input type="checkbox" name="readWholeVault" ${settings.readWholeVault ? "checked" : ""} />
+              Read the whole vault, not just the DM Helper folder
+            </label>
+            <div class="row">
+              <label>AI Context Note Limit
+                <input name="aiContextNoteLimit" type="number" min="1" max="12" step="1" value="${escapeHtml(String(settings.aiContextNoteLimit || 6))}" />
+              </label>
+              <label>AI Context Character Budget
+                <input name="aiContextCharLimit" type="number" min="800" max="12000" step="100" value="${escapeHtml(String(settings.aiContextCharLimit || 3600))}" />
+              </label>
+            </div>
+            <div class="toolbar">
+              <button class="btn btn-primary" type="submit">Save Vault Settings</button>
+              <button class="btn btn-secondary" type="button" data-action="obsidian-choose-vault">Choose Vault Folder</button>
+              <button class="btn btn-secondary" type="button" data-action="obsidian-open-vault" ${settings.vaultPath ? "" : "disabled"}>Open Vault Folder</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <h2>AI + Sync Actions</h2>
+          <ul class="flow-list">
+            <li><strong>Campaign Home:</strong> summary note with quick links.</li>
+            <li><strong>Sessions:</strong> one markdown note per session.</li>
+            <li><strong>NPCs / Quests / Locations:</strong> one markdown note per record.</li>
+            <li><strong>Kingdom:</strong> kingdom sheet snapshot, regions, settlements, and recent turns.</li>
+            <li><strong>Hex Map:</strong> party position, trail, forces, markers, and region notes.</li>
+            <li><strong>AI Read Context:</strong> compact excerpts from the most relevant vault notes are added to Loremaster prompts when enabled.</li>
+            <li><strong>AI Write Back:</strong> writes the current Loremaster output into <span class="mono">${escapeHtml(settings.aiWriteFolder || "AI Notes")}</span>.</li>
+          </ul>
+          <p class="small">This sync overwrites matching DM Helper notes, but it does not delete stale files you removed from the app.</p>
+          <div class="toolbar">
+            <button class="btn btn-primary" type="button" data-action="obsidian-sync" ${ui.obsidianBusy ? "disabled" : ""}>${syncLabel}</button>
+            <button class="btn btn-secondary" type="button" data-action="obsidian-write-current-ai" ${(hasAiOutput && !ui.obsidianBusy) ? "" : "disabled"}>${writeLabel}</button>
+          </div>
+        </article>
+      </section>
+    </div>
+  `;
 }
 
 function isStructuredWorldTab(tabId) {
@@ -4445,10 +7773,322 @@ function isPdfGroundedWorldRequest(tabId, inputText) {
   return isStructuredWorldTab(tabId) && isPdfGroundedQuestion(inputText);
 }
 
+function isRulesQuestionInput(inputText) {
+  const lower = str(inputText).toLowerCase();
+  if (!lower) return false;
+  return (
+    /\b(how does|how do|what are the requirements|what is the dc|what does this condition do|how does persistent damage|how does bleed|how does invisibility|how do reactions work)\b/.test(
+      lower
+    ) ||
+    /\b(bleed|persistent damage|condition|trait|feat|spell|focus spell|reaction|free action|activity|saving throw|armor class|ac|fortitude|reflex|will|proficiency|remaster)\b/.test(
+      lower
+    )
+  );
+}
+
+function isCampaignLookupInput(inputText) {
+  const lower = str(inputText).toLowerCase();
+  if (!lower) return false;
+  return (
+    /\b(who was|who is|what happened|what was the name|which faction|which npc|where did|when did|remind me|recall|what is our current|what is the current|what do we know about)\b/.test(
+      lower
+    ) ||
+    /\b(last town|last session|three sessions ago|our kingdom problem|current kingdom problem|swamp town|mayor|bandits)\b/.test(lower)
+  );
+}
+
+function isSessionSummaryInput(inputText) {
+  const lower = str(inputText).toLowerCase();
+  if (!lower) return false;
+  return /\b(summarize|summary|recap|session notes|table log|clean these notes|turn these notes|write a recap|session wrap-up|wrap up)\b/.test(lower);
+}
+
+function inferEntityTargetFromInput(tabId, inputText) {
+  if (tabId === "npcs") return "npc";
+  if (tabId === "quests") return "quest";
+  if (tabId === "locations") return "location";
+  const lower = str(inputText).toLowerCase();
+  if (/\bnpc\b/.test(lower)) return "npc";
+  if (/\bquest\b/.test(lower)) return "quest";
+  if (/\b(location|village|town|city|settlement|hex|place)\b/.test(lower)) return "location";
+  return "";
+}
+
+function isNoteUpdateInput(tabId, inputText) {
+  const lower = str(inputText).toLowerCase();
+  if (!lower) return false;
+  if (isStructuredWorldTab(tabId)) return !isCopilotSmallTalkInput(lower);
+  return /\b(create|make|build|draft|invent|design|rewrite|update|turn this into|clean up|make an npc note|make a quest|make a location)\b/.test(lower);
+}
+
+function isKingdomHelperInput(tabId, inputText) {
+  if (tabId === "kingdom") return true;
+  const lower = str(inputText).toLowerCase();
+  return /\b(kingdom|settlement|charter|government|heartland|consumption|control dc|ruin|unrest|economy|loyalty|stability|resource points|kingdom turn)\b/.test(lower);
+}
+
+function isMapHelperInput(tabId, inputText) {
+  if (tabId === "hexmap") return true;
+  const lower = str(inputText).toLowerCase();
+  return /\b(hex|map|terrain|region|work site|party marker|encounter marker|event marker|road|river|travel route)\b/.test(lower);
+}
+
+function getCopilotTaskMeta(taskType) {
+  return COPILOT_TASK_META[str(taskType)] || COPILOT_TASK_META.general_prep;
+}
+
+function buildRulesQuestionPrompt(requestText) {
+  const compactInput = compactCopilotRequestText(requestText, 420);
+  return [
+    "Answer this as a Pathfinder 2e rules question using local grounded context first.",
+    "Separate confirmed rules from house-rule or campaign inference.",
+    "If the local context is thin, say that clearly instead of guessing.",
+    "Return:",
+    "Rules Answer:",
+    "- 3 to 6 concise bullets",
+    "Official vs Local Notes:",
+    "- Confirmed official rule",
+    "- House rule or campaign override if present",
+    "Source Trail:",
+    "- bullet",
+    "",
+    "GM question:",
+    compactInput,
+  ].join("\n");
+}
+
+function buildCampaignLookupPrompt(requestText) {
+  const compactInput = compactCopilotRequestText(requestText, 420);
+  return [
+    "Answer this as a campaign-memory lookup grounded in app records, vault notes, and retrieved PDFs when relevant.",
+    "Keep the answer concise and tied to actual campaign state.",
+    "Return:",
+    "Campaign Answer:",
+    "- 2 to 5 bullets",
+    "Key Linked Entities:",
+    "- bullet",
+    "Open Threads:",
+    "- bullet",
+    "",
+    "GM question:",
+    compactInput,
+  ].join("\n");
+}
+
+function buildTaskRoutedRequest(tabId, userInput, autoRun) {
+  const seedPrompt = buildGlobalCopilotSeedPrompt(tabId);
+  const baseMode = getGlobalCopilotMode(tabId);
+  const cleanInput = str(userInput);
+  const meta = (taskType, extra = {}) => ({
+    taskType,
+    taskLabel: getCopilotTaskMeta(taskType).label,
+    saveTarget: getCopilotTaskMeta(taskType).saveTarget,
+    routeReason: str(extra.routeReason || ""),
+    entityType: str(extra.entityType || ""),
+  });
+
+  const defaultTaskByTab = (() => {
+    if (tabId === "sessions" || tabId === "capture") return "session_summary";
+    if (tabId === "npcs" || tabId === "quests" || tabId === "locations") return "note_update";
+    if (tabId === "rules") return "rules_question";
+    if (tabId === "kingdom") return "kingdom_helper";
+    if (tabId === "hexmap") return "map_helper";
+    if (tabId === "pdf") return "pdf_lookup";
+    if (tabId === "obsidian") return "vault_workflow";
+    if (tabId === "foundry") return "foundry_handoff";
+    if (tabId === "writing") return "writing_cleanup";
+    return "general_prep";
+  })();
+
+  if (autoRun || !cleanInput) {
+    return {
+      mode: getCopilotTaskMeta(defaultTaskByTab).mode || baseMode,
+      input: seedPrompt,
+      isChat: false,
+      ...meta(defaultTaskByTab, { routeReason: autoRun ? "automatic tab run" : "empty input defaults to tab workflow" }),
+    };
+  }
+
+  if (isCopilotSmallTalkInput(cleanInput)) {
+    return {
+      mode: "assistant",
+      input: cleanInput,
+      isChat: true,
+      ...meta("small_talk", { routeReason: "short conversational input" }),
+    };
+  }
+
+  if (tabId === "obsidian") {
+    return {
+      mode: "prep",
+      input: `${seedPrompt}\n\nRequest:\n${compactCopilotRequestText(cleanInput, 420)}`,
+      isChat: false,
+      ...meta("vault_workflow", { routeReason: "obsidian tab request" }),
+    };
+  }
+
+  if (tabId === "foundry") {
+    return {
+      mode: "prep",
+      input: `${seedPrompt}\n\nRequest:\n${compactCopilotRequestText(cleanInput, 380)}`,
+      isChat: false,
+      ...meta("foundry_handoff", { routeReason: "foundry export workflow" }),
+    };
+  }
+
+  if (tabId === "writing") {
+    return {
+      mode: "session",
+      input: `${seedPrompt}\n\nDraft to clean up:\n${cleanInput}`,
+      isChat: false,
+      ...meta("writing_cleanup", { routeReason: "writing helper request" }),
+    };
+  }
+
+  if (tabId === "rules") {
+    return {
+      mode: "assistant",
+      input: buildRulesQuestionPrompt(cleanInput),
+      isChat: false,
+      ...meta("rules_question", { routeReason: "rules tab workflow" }),
+    };
+  }
+
+  if (tabId === "pdf" || isPdfGroundedQuestion(cleanInput)) {
+    const compactInput = compactCopilotRequestText(cleanInput, 420);
+    return {
+      mode: "prep",
+      input: [
+        "Use the selected PDF summary and indexed PDF snippets to answer the GM's question.",
+        "If the available PDF context is thin or missing, say that clearly instead of guessing.",
+        "Return:",
+        "Book Takeaways:",
+        "- 3 to 6 bullets grounded in the PDF context",
+        "How To Run It:",
+        "- 4 to 8 GM-facing bullets",
+        "Next PDF Queries:",
+        "- bullet",
+        "- bullet",
+        "",
+        "GM question:",
+        compactInput,
+      ].join("\n"),
+      isChat: false,
+      ...meta("pdf_lookup", { routeReason: "pdf-specific wording or pdf tab" }),
+    };
+  }
+
+  if (isKingdomHelperInput(tabId, cleanInput)) {
+    return {
+      mode: "session",
+      input: `${buildGlobalCopilotSeedPrompt("kingdom")}\n\nAdditional request:\n${compactCopilotRequestText(cleanInput, 420)}`,
+      isChat: false,
+      ...meta("kingdom_helper", { routeReason: "kingdom terms detected" }),
+    };
+  }
+
+  if (isMapHelperInput(tabId, cleanInput)) {
+    return {
+      mode: "location",
+      input: `${buildGlobalCopilotSeedPrompt("hexmap")}\n\nAdditional request:\n${compactCopilotRequestText(cleanInput, 420)}`,
+      isChat: false,
+      ...meta("map_helper", { routeReason: "hex map terms detected" }),
+    };
+  }
+
+  if (isRulesQuestionInput(cleanInput)) {
+    return {
+      mode: "assistant",
+      input: buildRulesQuestionPrompt(cleanInput),
+      isChat: false,
+      ...meta("rules_question", { routeReason: "rules question phrasing detected" }),
+    };
+  }
+
+  if (isSessionSummaryInput(cleanInput) || tabId === "capture") {
+    return {
+      mode: "session",
+      input: `${buildGlobalCopilotSeedPrompt(tabId === "capture" ? "capture" : "sessions")}\n\nSource text or request:\n${cleanInput}`,
+      isChat: false,
+      ...meta("session_summary", { routeReason: "summary / recap wording detected" }),
+    };
+  }
+
+  if (isPdfGroundedWorldRequest(tabId, cleanInput)) {
+    return {
+      mode: baseMode,
+      input: buildPdfGroundedWorldPrompt(tabId, cleanInput),
+      isChat: false,
+      ...meta("note_update", { routeReason: "world note request grounded in selected PDF", entityType: inferEntityTargetFromInput(tabId, cleanInput) }),
+    };
+  }
+
+  const inferredMode = inferStructuredModeFromInput(cleanInput);
+  if (inferredMode) {
+    const targetTab = getSeedTabForMode(inferredMode);
+    const compactInput = compactCopilotRequestText(cleanInput, inferredMode === "npc" ? 420 : 340);
+    return {
+      mode: inferredMode,
+      input: `${buildGlobalCopilotSeedPrompt(targetTab)}\n${getStructuredWorldDetailInstruction(targetTab)}\n\nAdditional request:\n${compactInput}`,
+      isChat: false,
+      ...meta("note_update", { routeReason: "entity-creation wording detected", entityType: inferredMode }),
+    };
+  }
+
+  if (isNoteUpdateInput(tabId, cleanInput)) {
+    const entityType = inferEntityTargetFromInput(tabId, cleanInput);
+    const targetTab = entityType ? getSeedTabForMode(entityType) : tabId;
+    const compactInput = compactCopilotRequestText(cleanInput, targetTab === "npcs" ? 420 : 340);
+    return {
+      mode: entityType || baseMode,
+      input: `${buildGlobalCopilotSeedPrompt(targetTab)}\n${getStructuredWorldDetailInstruction(targetTab)}\n\nAdditional request:\n${compactInput}`,
+      isChat: false,
+      ...meta("note_update", { routeReason: "note creation/update wording detected", entityType }),
+    };
+  }
+
+  if (isCampaignLookupInput(cleanInput)) {
+    return {
+      mode: "assistant",
+      input: buildCampaignLookupPrompt(cleanInput),
+      isChat: false,
+      ...meta("campaign_lookup", { routeReason: "campaign memory lookup wording detected" }),
+    };
+  }
+
+  if (shouldUseCopilotChatMode(tabId, cleanInput)) {
+    return {
+      mode: "assistant",
+      input: cleanInput,
+      isChat: true,
+      ...meta("campaign_lookup", { routeReason: "short direct GM question" }),
+    };
+  }
+
+  if (tabId === "dashboard") {
+    return {
+      mode: baseMode,
+      input: `${seedPrompt}\n\nGM request:\n${cleanInput}`,
+      isChat: false,
+      ...meta("general_prep", { routeReason: "dashboard prep request" }),
+    };
+  }
+
+  return {
+    mode: baseMode,
+    input: `${seedPrompt}\n\nAdditional request:\n${cleanInput}`,
+    isChat: false,
+    ...meta(defaultTaskByTab, { routeReason: "tab workflow default" }),
+  };
+}
+
 function shouldUseCopilotChatMode(tabId, inputText) {
   const text = str(inputText);
   if (!text) return false;
   const lower = text.toLowerCase();
+  if (tabId === "hexmap" && /\b(hex|map|encounter|event|terrain|region|work site|building|settlement)\b/.test(lower)) {
+    return false;
+  }
   if (
     tabId === "sessions" &&
     /\b(idea|ideas|hook|hooks|scene|scenes|encounter|encounters|village|town|quest|npc|prep|session|run|opening)\b/.test(
@@ -4474,90 +8114,7 @@ function shouldUseCopilotChatMode(tabId, inputText) {
 }
 
 function buildGlobalCopilotRequest(tabId, userInput, autoRun) {
-  const seedPrompt = buildGlobalCopilotSeedPrompt(tabId);
-  const baseMode = getGlobalCopilotMode(tabId);
-  const cleanInput = str(userInput);
-  if (autoRun) {
-    return {
-      mode: baseMode,
-      input: seedPrompt,
-      isChat: false,
-    };
-  }
-  if (!cleanInput) {
-    return {
-      mode: baseMode,
-      input: seedPrompt,
-      isChat: false,
-    };
-  }
-  const inferredMode = inferStructuredModeFromInput(cleanInput);
-  if (isPdfGroundedWorldRequest(tabId, cleanInput) && !isCopilotSmallTalkInput(cleanInput)) {
-    return {
-      mode: baseMode,
-      input: buildPdfGroundedWorldPrompt(tabId, cleanInput),
-      isChat: false,
-    };
-  }
-  if (inferredMode && !isCopilotSmallTalkInput(cleanInput)) {
-    const compactInput = compactCopilotRequestText(cleanInput, inferredMode === "npc" ? 420 : 340);
-    return {
-      mode: inferredMode,
-      input: `${buildGlobalCopilotSeedPrompt(getSeedTabForMode(inferredMode))}\n${getStructuredWorldDetailInstruction(
-        getSeedTabForMode(inferredMode)
-      )}\n\nAdditional request:\n${compactInput}`,
-      isChat: false,
-    };
-  }
-  if (isStructuredWorldTab(tabId) && !isCopilotSmallTalkInput(cleanInput)) {
-    const compactInput = compactCopilotRequestText(cleanInput, tabId === "npcs" ? 420 : 340);
-    return {
-      mode: baseMode,
-      input: `${seedPrompt}\n${getStructuredWorldDetailInstruction(tabId)}\n\nAdditional request:\n${compactInput}`,
-      isChat: false,
-    };
-  }
-  if ((tabId === "pdf" || isPdfGroundedQuestion(cleanInput)) && !isCopilotSmallTalkInput(cleanInput)) {
-    const compactInput = compactCopilotRequestText(cleanInput, 420);
-    return {
-      mode: "prep",
-      input: [
-        "Use the selected PDF summary and indexed PDF snippets to answer the GM's question.",
-        "If the available PDF context is thin or missing, say that clearly instead of guessing.",
-        "Return:",
-        "Book Takeaways:",
-        "- 3 to 6 bullets grounded in the PDF context",
-        "How To Run It:",
-        "- 4 to 8 GM-facing bullets",
-        "Next PDF Queries:",
-        "- bullet",
-        "- bullet",
-        "",
-        "GM question:",
-        compactInput,
-      ].join("\n"),
-      isChat: false,
-    };
-  }
-  if (shouldUseCopilotChatMode(tabId, cleanInput)) {
-    return {
-      mode: "assistant",
-      input: cleanInput,
-      isChat: true,
-    };
-  }
-  if (tabId === "dashboard") {
-    return {
-      mode: baseMode,
-      input: cleanInput,
-      isChat: false,
-    };
-  }
-  return {
-    mode: baseMode,
-    input: `${seedPrompt}\n\nAdditional request:\n${cleanInput}`,
-    isChat: false,
-  };
+  return buildTaskRoutedRequest(tabId, userInput, autoRun);
 }
 
 function isCopilotSmallTalkInput(inputText) {
@@ -4652,6 +8209,19 @@ function buildGlobalCopilotSeedPrompt(tabId) {
       "- bullet",
     ].join("\n");
   }
+  if (tabId === "rules") {
+    return [
+      "Answer this as a Pathfinder 2e rules question using official rules context first and local rulings second.",
+      "Return:",
+      "Rules Answer:",
+      "- 3 to 6 concise bullets",
+      "Official vs Local Notes:",
+      "- Confirmed official rule",
+      "- Local override or house rule if present",
+      "Source Trail:",
+      "- bullet",
+    ].join("\n");
+  }
   if (tabId === "kingdom") {
     return [
       "Using the active V&K kingdom rules profile and current kingdom state, help the GM run the next kingdom turn.",
@@ -4668,6 +8238,21 @@ function buildGlobalCopilotSeedPrompt(tabId) {
       "What To Record In DM Helper:",
       "- bullet",
       "- bullet",
+    ].join("\n");
+  }
+  if (tabId === "hexmap") {
+    return [
+      "Build one table-ready hex brief for the selected kingdom hex.",
+      "Return:",
+      "Hex Summary:",
+      "- 2 to 4 bullets",
+      "What The Party Notices First:",
+      "- bullet",
+      "- bullet",
+      "Encounter / Event Seeds:",
+      "- 3 concise hooks or complications",
+      "What To Record On The Map:",
+      "- status, terrain, work site, or marker ideas",
     ].join("\n");
   }
   if (tabId === "npcs") {
@@ -4717,6 +8302,12 @@ function buildGlobalCopilotSeedPrompt(tabId) {
       "Why:",
     ].join("\n");
   }
+  if (tabId === "obsidian") {
+    return [
+      "Help organize DM Helper data into useful Obsidian markdown notes.",
+      "Return concise, practical note structure advice or markdown examples only.",
+    ].join("\n");
+  }
   if (tabId === "foundry") {
     return [
       "Create a Foundry handoff checklist for next session.",
@@ -4760,6 +8351,16 @@ function buildGlobalCopilotContext(tabId) {
     tabContext = `Latest session summary: ${str(latest?.summary)} | Next prep: ${str(latest?.nextPrep)}`;
   } else if (tabId === "capture") {
     tabContext = `Recent live capture: ${recentCapture.join(" | ") || "No capture entries yet."}`;
+  } else if (tabId === "rules") {
+    const aiMemory = ensureAiMemoryState();
+    const selectedRule = getSelectedRulesResult(ui.rulesResults);
+    const recentRules = getRecentRuleCaptureEntries(4);
+    const savedRules = ensureRulesStore();
+    tabContext = `Rules query: ${ui.rulesSearchQuery || "(none)"} | Selected official rule: ${selectedRule?.title || "none"} | Official results loaded: ${
+      Array.isArray(ui.rulesResults) ? ui.rulesResults.length : 0
+    } | Local rulings digest: ${clipDigestText(aiMemory.rulingsDigest || "none", 320)} | Recent rule captures: ${
+      recentRules.map((entry) => entry.note).filter(Boolean).join(" | ") || "none"
+    } | Saved rules store entries: ${savedRules.length} | Canon memory digest: ${clipDigestText(aiMemory.canonSummary || "none", 220)}`;
   } else if (tabId === "kingdom") {
     const kingdom = getKingdomState();
     const profile = getActiveKingdomProfile();
@@ -4768,6 +8369,20 @@ function buildGlobalCopilotContext(tabId) {
     } | Unrest ${kingdom.unrest} | Renown ${kingdom.renown} | Fame ${kingdom.fame} | Infamy ${kingdom.infamy} | Settlements ${
       kingdom.settlements.length
     } | Claimed regions ${kingdom.regions.length} | Active profile: ${profile?.shortLabel || profile?.label || "Unknown"}`;
+  } else if (tabId === "hexmap") {
+    const hexMap = getHexMapState();
+    const selectedHex = getHexMapSelectedHex(hexMap);
+    const region = getKingdomRegionByHex(selectedHex);
+    const markers = getHexMapMarkersForHex(selectedHex);
+    const forces = getHexMapForcesForHex(selectedHex);
+    const party = getHexMapParty(hexMap);
+    tabContext = `Hex map: ${hexMap.mapName} | Selected hex: ${selectedHex} | Region status: ${region?.status || "none"} | Terrain: ${
+      region?.terrain || "none"
+    } | Work site: ${region?.workSite || "none"} | Markers in hex: ${markers.length} | Forces in hex: ${forces.length} | Party hex: ${
+      party.hex || "not placed"
+    } | Party trail points: ${party.trail.length} | Background loaded: ${
+      hexMap.backgroundName || "no"
+    }`;
   } else if (tabId === "npcs") {
     tabContext = `Current NPC names: ${state.npcs.slice(0, 15).map((n) => n.name).join(", ") || "None"}${
       selectedPdfFile ? ` | Selected PDF: ${selectedPdfFile} | Selected PDF summary: ${selectedPdfSummary || "No summary yet."}` : ""
@@ -4786,6 +8401,13 @@ function buildGlobalCopilotContext(tabId) {
     tabContext = `Selected PDF: ${selectedPdfFile || "(none)"} | PDF query: ${ui.pdfSearchQuery || "(none)"} | Snippets: ${
       snippets.join(" || ") || "No snippets yet."
     } | Selected PDF summary: ${summaryText || "No summary yet."}`;
+  } else if (tabId === "obsidian") {
+    const settings = ensureObsidianSettings();
+    tabContext = `Obsidian vault path: ${settings.vaultPath || "(not set)"} | Base folder: ${settings.baseFolder || "DM Helper"} | AI read enabled: ${
+      settings.useForAiContext ? "yes" : "no"
+    } | Read scope: ${settings.readWholeVault ? "whole vault" : "DM Helper folder only"} | AI note folder: ${
+      settings.aiWriteFolder || "AI Notes"
+    } | Last sync: ${settings.lastSyncAt || "never"} | Last sync summary: ${settings.lastSyncSummary || "none"}`;
   } else if (tabId === "foundry") {
     tabContext = `Foundry export counts: NPCs ${state.npcs.length}, Quests ${state.quests.length}, Locations ${state.locations.length}.`;
   } else if (tabId === "writing") {
@@ -4797,6 +8419,7 @@ function buildGlobalCopilotContext(tabId) {
     activeTab: tabId,
     tabLabel: getTabLabel(tabId),
     tabContext,
+    aonRulesMatches: tabId === "rules" ? sortRulesResults(ui.rulesSearchQuery, ui.rulesResults).slice(0, 4) : [],
     selectedPdfFile,
     selectedPdfSummary,
     aiHistory,
@@ -4813,6 +8436,343 @@ function buildMinimalCopilotContext(tabId) {
     activeTab: tabId,
     tabLabel: getTabLabel(tabId),
     tabContext: "Small-talk chat. Reply briefly and naturally.",
+  };
+}
+
+function extractRetrievalTerms(text) {
+  return [...new Set(
+    str(text)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .map((word) => word.trim())
+      .filter((word) => word.length >= 3)
+  )];
+}
+
+function countRetrievalTokenHits(text, terms) {
+  const haystack = str(text).toLowerCase();
+  if (!haystack || !Array.isArray(terms) || !terms.length) return 0;
+  let hits = 0;
+  for (const term of terms) {
+    if (haystack.includes(term)) hits += 1;
+  }
+  return hits;
+}
+
+function getRetrievalProfile(taskType, entityType = "") {
+  const sourceWeights = {
+    general_prep: { session: 2.4, quest: 2.2, npc: 2.1, location: 2, kingdom: 1.8, hex: 1.8, rule: 1.5, canon: 2.3, aon_rule: 1.6, vault: 1.7, pdf_summary: 1.6 },
+    rules_question: { rule: 3.8, canon: 1.6, aon_rule: 4.2, pdf_summary: 3.2, vault: 2.4, session: 0.8, quest: 0.7, npc: 0.6, location: 0.6, kingdom: 0.9, hex: 0.6 },
+    campaign_lookup: { session: 3.2, quest: 3.1, npc: 3.1, location: 3, kingdom: 1.8, hex: 1.5, rule: 1, canon: 3.2, aon_rule: 1.1, vault: 2.2, pdf_summary: 1.2 },
+    session_summary: { session: 3.4, quest: 2.4, npc: 2.2, location: 2.1, kingdom: 1.6, hex: 1.3, rule: 1.2, canon: 2.1, aon_rule: 1.1, vault: 1.8, pdf_summary: 1.4 },
+    note_update: { session: 2, quest: 2, npc: 2, location: 2, kingdom: 1.4, hex: 1.2, rule: 1, canon: 2.4, aon_rule: 1.2, vault: 1.8, pdf_summary: 2.2 },
+    kingdom_helper: { kingdom: 4, hex: 2.6, session: 1.8, quest: 1.2, npc: 1.1, location: 1.4, rule: 1.6, canon: 1.6, aon_rule: 1.3, vault: 1.8, pdf_summary: 1.3 },
+    map_helper: { hex: 4, location: 2.9, kingdom: 2.4, session: 1.4, quest: 1.2, npc: 1.1, rule: 1, canon: 1.4, aon_rule: 0.9, vault: 1.5, pdf_summary: 1.1 },
+    pdf_lookup: { pdf_summary: 4, rule: 2, canon: 1, aon_rule: 1.4, vault: 1.8, session: 1.1, quest: 1, npc: 1, location: 1, kingdom: 0.9, hex: 0.8 },
+    vault_workflow: { vault: 4, session: 2, quest: 1.6, npc: 1.6, location: 1.6, kingdom: 1.4, hex: 1.2, rule: 1.2, canon: 1.2, aon_rule: 1.1, pdf_summary: 1.2 },
+    foundry_handoff: { session: 2.8, quest: 2, npc: 2, location: 2, kingdom: 1.2, hex: 1.1, rule: 0.8, canon: 1.8, aon_rule: 0.8, vault: 1.3, pdf_summary: 1 },
+    writing_cleanup: { session: 2.4, quest: 1.8, npc: 1.8, location: 1.8, kingdom: 1.2, hex: 1, rule: 1, canon: 1.5, aon_rule: 0.8, vault: 1.4, pdf_summary: 1.1 },
+    small_talk: { session: 0, quest: 0, npc: 0, location: 0, kingdom: 0, hex: 0, rule: 0, canon: 0, aon_rule: 0, vault: 0, pdf_summary: 0 },
+  };
+
+  const profile = {
+    maxChunks: 8,
+    minScore: 1.4,
+    sourceWeights: sourceWeights[taskType] || sourceWeights.general_prep,
+  };
+
+  if (taskType === "rules_question") profile.maxChunks = 7;
+  if (taskType === "campaign_lookup") profile.maxChunks = 9;
+  if (taskType === "note_update" && entityType === "npc") profile.maxChunks = 7;
+  if (taskType === "note_update" && entityType === "location") profile.maxChunks = 7;
+  if (taskType === "small_talk") profile.maxChunks = 0;
+
+  return profile;
+}
+
+function buildUnifiedRetrievalQuery({ userInput, route, baseContext, tabId }) {
+  const parts = [
+    str(userInput),
+    str(route?.taskLabel),
+    str(route?.entityType),
+    str(baseContext?.tabContext),
+    str(baseContext?.latestSession?.title),
+    str(baseContext?.latestSession?.summary),
+    tabId === "pdf" ? str(baseContext?.selectedPdfFile) : "",
+  ]
+    .map((value) => value.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return parts.join(" ").trim();
+}
+
+function computeRetrievalCandidateScore({ query, terms, title, text, sourceType, taskType, entityType, updatedAt }) {
+  const combined = `${str(title)} ${str(text)}`.trim();
+  if (!combined) return 0;
+  const lowerCombined = combined.toLowerCase();
+  const phraseScore = relevanceScore(query, title) * 1.8 + relevanceScore(query, combined) * 0.6;
+  const tokenHits = countRetrievalTokenHits(lowerCombined, terms);
+  const sourceWeight = Number(getRetrievalProfile(taskType, entityType).sourceWeights?.[sourceType] || 0);
+  const updatedKey = safeDate(updatedAt);
+  const recencyBoost = Number.isFinite(updatedKey) ? Math.max(0, Math.min(1.4, (updatedKey - (Date.now() - 1000 * 60 * 60 * 24 * 21)) / (1000 * 60 * 60 * 24 * 21))) : 0;
+  return Number((phraseScore + tokenHits * 1.15 + sourceWeight + recencyBoost).toFixed(2));
+}
+
+function summarizeHexMapForRetrieval() {
+  const hexMap = getHexMapState();
+  const selectedHex = getHexMapSelectedHex(hexMap);
+  const selectedRegion = getKingdomRegionByHex(selectedHex);
+  const markers = getHexMapMarkersForHex(selectedHex);
+  const forces = getHexMapForcesForHex(selectedHex);
+  const party = getHexMapParty(hexMap);
+  return {
+    title: `Hex Map ${selectedHex || "(no selected hex)"}`,
+    text: [
+      `Map ${hexMap.mapName || "Hex Map"}`,
+      `Selected hex ${selectedHex || "none"}`,
+      `Region status ${selectedRegion?.status || "none"}`,
+      `Terrain ${selectedRegion?.terrain || "none"}`,
+      `Work site ${selectedRegion?.workSite || "none"}`,
+      `Markers ${markers.map((marker) => `${marker.type}: ${marker.notes || "no notes"}`).join(" | ") || "none"}`,
+      `Forces ${forces.map((force) => `${force.type}: ${force.notes || "no notes"}`).join(" | ") || "none"}`,
+      `Party hex ${party.hex || "not placed"}`,
+      `Party trail ${Array.isArray(party.trail) ? party.trail.join(" -> ") : "none"}`,
+    ].join(" • "),
+    updatedAt: hexMap.updatedAt || "",
+  };
+}
+
+function buildUnifiedRetrievalContext({ tabId, userInput, route, baseContext, obsidianNotes = [] }) {
+  const taskType = str(route?.taskType || baseContext?.taskType || "general_prep");
+  const entityType = str(route?.entityType || baseContext?.entityType || "");
+  const profile = getRetrievalProfile(taskType, entityType);
+  const query = buildUnifiedRetrievalQuery({ userInput, route, baseContext, tabId });
+  const terms = extractRetrievalTerms(query);
+  const candidates = [];
+
+  if (!profile.maxChunks || taskType === "small_talk") {
+    return {
+      retrievalSummary: {
+        taskType,
+        taskLabel: str(route?.taskLabel || baseContext?.taskLabel || ""),
+        query,
+        generatedAt: new Date().toLocaleTimeString(),
+        sourceCounts: {},
+        chunkCount: 0,
+      },
+      retrievedChunks: [],
+    };
+  }
+
+  const pushCandidate = ({ sourceType, sourceLabel, title, text, updatedAt, reason }) => {
+    const cleanTitle = str(title);
+    const cleanText = str(text).replace(/\s+/g, " ").trim();
+    if (!cleanTitle || !cleanText) return;
+    const score = computeRetrievalCandidateScore({
+      query,
+      terms,
+      title: cleanTitle,
+      text: cleanText,
+      sourceType,
+      taskType,
+      entityType,
+      updatedAt,
+    });
+    if (score < profile.minScore) return;
+    candidates.push({
+      sourceType,
+      sourceLabel: str(sourceLabel || sourceType),
+      title: cleanTitle,
+      text: compactLine(cleanText, 420),
+      updatedAt: str(updatedAt),
+      score,
+      reason: str(reason),
+    });
+  };
+
+  const recentSessions = [...(state.sessions || [])]
+    .sort((a, b) => safeDate(b.date || b.updatedAt || b.createdAt) - safeDate(a.date || a.updatedAt || a.createdAt))
+    .slice(0, 8);
+  for (const session of recentSessions) {
+    pushCandidate({
+      sourceType: "session",
+      sourceLabel: "Session",
+      title: session.title || "Untitled session",
+      text: [
+        `Summary ${session.summary || "none"}`,
+        `Next prep ${session.nextPrep || "none"}`,
+        `Arc ${session.arc || "none"}`,
+      ].join(" • "),
+      updatedAt: session.date || session.updatedAt || session.createdAt || "",
+      reason: "recent session record",
+    });
+  }
+
+  for (const quest of state.quests || []) {
+    pushCandidate({
+      sourceType: "quest",
+      sourceLabel: "Quest",
+      title: quest.title || "Untitled quest",
+      text: [
+        `Status ${quest.status || "unknown"}`,
+        `Objective ${quest.objective || "none"}`,
+        `Giver ${quest.giver || "none"}`,
+        `Stakes ${quest.stakes || "none"}`,
+      ].join(" • "),
+      updatedAt: quest.updatedAt || quest.createdAt || "",
+      reason: "quest record",
+    });
+  }
+
+  for (const npc of state.npcs || []) {
+    pushCandidate({
+      sourceType: "npc",
+      sourceLabel: "NPC",
+      title: npc.name || "Unnamed NPC",
+      text: [
+        `Role ${npc.role || "none"}`,
+        `Agenda ${npc.agenda || "none"}`,
+        `Disposition ${npc.disposition || "none"}`,
+        `Notes ${npc.notes || "none"}`,
+      ].join(" • "),
+      updatedAt: npc.updatedAt || npc.createdAt || "",
+      reason: "NPC record",
+    });
+  }
+
+  for (const location of state.locations || []) {
+    pushCandidate({
+      sourceType: "location",
+      sourceLabel: "Location",
+      title: location.name || "Unnamed location",
+      text: [
+        `Hex ${location.hex || "none"}`,
+        `Changed ${location.whatChanged || "none"}`,
+        `Notes ${location.notes || "none"}`,
+      ].join(" • "),
+      updatedAt: location.updatedAt || location.createdAt || "",
+      reason: "location record",
+    });
+  }
+
+  const kingdom = getKingdomState();
+  pushCandidate({
+    sourceType: "kingdom",
+    sourceLabel: "Kingdom",
+    title: kingdom.name || "Kingdom Sheet",
+    text: [
+      `Turn ${kingdom.currentTurnLabel || "none"}`,
+      `Level ${kingdom.level || 0}`,
+      `Control DC ${kingdom.controlDC || 0}`,
+      `Unrest ${kingdom.unrest || 0}`,
+      `Resources RP ${kingdom.resourcePoints || 0} Food ${kingdom.food || 0} Lumber ${kingdom.lumber || 0} Ore ${kingdom.ore || 0} Stone ${kingdom.stone || 0} Luxuries ${kingdom.luxuries || 0}`,
+      `Settlements ${(kingdom.settlements || []).map((item) => item.name).filter(Boolean).join(", ") || "none"}`,
+      `Notes ${kingdom.notes || "none"}`,
+    ].join(" • "),
+    updatedAt: kingdom.updatedAt || "",
+    reason: "kingdom state",
+  });
+
+  const hexSummary = summarizeHexMapForRetrieval();
+  pushCandidate({
+    sourceType: "hex",
+    sourceLabel: "Hex Map",
+    title: hexSummary.title,
+    text: hexSummary.text,
+    updatedAt: hexSummary.updatedAt,
+    reason: "hex map state",
+  });
+
+  const ruleEntries = [...(state.liveCapture || [])]
+    .filter((entry) => {
+      const kind = str(entry?.kind).toLowerCase();
+      return kind === "rule" || kind === "retcon" || kind === "house rule";
+    })
+    .sort((a, b) => safeDate(b.timestamp) - safeDate(a.timestamp))
+    .slice(0, 10);
+  for (const entry of ruleEntries) {
+    pushCandidate({
+      sourceType: "rule",
+      sourceLabel: "Ruling",
+      title: `${entry.kind || "Rule"} ${formatAiHistoryTimestamp(entry.timestamp) || ""}`.trim(),
+      text: entry.note || "",
+      updatedAt: entry.timestamp || "",
+      reason: "captured ruling",
+    });
+  }
+
+  for (const entry of ensureRulesStore()) {
+    pushCandidate({
+      sourceType: entry.kind === "canon_memory" ? "canon" : "rule",
+      sourceLabel: entry.kind === "canon_memory" ? "Canon Memory" : "Saved Rule",
+      title: `${getRuleStoreKindLabel(entry.kind)} • ${entry.title}`.trim(),
+      text: [entry.text || "", entry.sourceTitle ? `Source ${entry.sourceTitle}` : "", entry.tags?.length ? `Tags ${entry.tags.join(", ")}` : ""]
+        .filter(Boolean)
+        .join(" • "),
+      updatedAt: entry.updatedAt || entry.createdAt || "",
+      reason: entry.kind === "canon_memory" ? "saved canon memory" : "saved rule store",
+    });
+  }
+
+  for (const summary of Object.values(getPdfSummaryMap())) {
+    pushCandidate({
+      sourceType: "pdf_summary",
+      sourceLabel: "PDF Summary",
+      title: str(summary?.fileName || "Indexed PDF"),
+      text: str(summary?.summary || ""),
+      updatedAt: str(summary?.updatedAt || summary?.summaryUpdatedAt || ""),
+      reason: "saved PDF memory",
+    });
+  }
+
+  for (const note of Array.isArray(obsidianNotes) ? obsidianNotes : []) {
+    pushCandidate({
+      sourceType: "vault",
+      sourceLabel: "Vault Note",
+      title: str(note?.title || note?.relativePath || "Vault note"),
+      text: [str(note?.relativePath), str(note?.excerpt)].filter(Boolean).join(" • "),
+      updatedAt: str(note?.modifiedAt || ""),
+      reason: "vault retrieval",
+    });
+  }
+
+  for (const match of Array.isArray(baseContext?.aonRulesMatches) ? baseContext.aonRulesMatches : []) {
+    pushCandidate({
+      sourceType: "aon_rule",
+      sourceLabel: "AoN Rule",
+      title: str(match?.title || "PF2e rule"),
+      text: [str(match?.snippet), str(match?.url)].filter(Boolean).join(" • "),
+      updatedAt: "",
+      reason: "live AoN rules lookup",
+    });
+  }
+
+  candidates.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
+  const deduped = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = `${candidate.sourceType}::${candidate.title}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(candidate);
+    if (deduped.length >= profile.maxChunks) break;
+  }
+
+  const sourceCounts = {};
+  for (const chunk of deduped) {
+    sourceCounts[chunk.sourceType] = (sourceCounts[chunk.sourceType] || 0) + 1;
+  }
+
+  return {
+    retrievalSummary: {
+      taskType,
+      taskLabel: str(route?.taskLabel || baseContext?.taskLabel || ""),
+      query: compactLine(query, 220),
+      generatedAt: new Date().toLocaleTimeString(),
+      sourceCounts,
+      chunkCount: deduped.length,
+    },
+    retrievedChunks: deduped,
   };
 }
 
@@ -4864,6 +8824,7 @@ async function runCopilotAiAttempt({ mode, input, config, tabId, userInput, cont
 async function maybeAutoRunCopilotOnTabChange(trigger = "tab-switch") {
   const config = ensureAiConfig();
   if (!config.autoRunTabs) return;
+  if (activeTab === "obsidian") return;
   if (!desktopApi?.generateLocalAiText) return;
   if (ui.copilotBusy || ui.aiBusy) return;
   await runGlobalAiCopilot({ autoRun: true, trigger });
@@ -4916,7 +8877,23 @@ async function runGlobalAiCopilot(options = {}) {
   }
 
   const isSmallTalk = request.isChat && isCopilotSmallTalkInput(userInput);
-  const contextOverride = isSmallTalk ? buildMinimalCopilotContext(activeTab) : null;
+  const runtimeContext = await buildCopilotRuntimeContext(
+    activeTab,
+    userInput || input,
+    isSmallTalk
+      ? { baseContext: buildMinimalCopilotContext(activeTab), skipVault: true, route: request }
+      : { route: request }
+  );
+  ui.copilotRetrievalPreview = runtimeContext?.retrievalSummary
+    ? {
+        ...runtimeContext.retrievalSummary,
+        chunks: Array.isArray(runtimeContext?.retrievedChunks) ? runtimeContext.retrievedChunks : [],
+      }
+    : null;
+  const vaultNoteCount = Array.isArray(runtimeContext?.obsidianVaultNotes) ? runtimeContext.obsidianVaultNotes.length : 0;
+  const aonRuleCount = Array.isArray(runtimeContext?.aonRulesMatches) ? runtimeContext.aonRulesMatches.length : 0;
+  const vaultContextSuffix = vaultNoteCount ? ` Used vault context from ${vaultNoteCount} note${vaultNoteCount === 1 ? "" : "s"}.` : "";
+  const aonContextSuffix = aonRuleCount ? ` Used AoN rules context from ${aonRuleCount} rule page${aonRuleCount === 1 ? "" : "s"}.` : "";
   const requestId = (Number(ui.copilotRequestSeq) || 0) + 1;
   ui.copilotRequestSeq = requestId;
   ui.copilotActiveRequestId = requestId;
@@ -4938,7 +8915,7 @@ async function runGlobalAiCopilot(options = {}) {
       config: effectiveConfig,
       tabId: activeTab,
       userInput,
-      contextOverride,
+      contextOverride: runtimeContext,
     });
     if (requestId !== ui.copilotActiveRequestId) return;
     let finalAttempt = primaryAttempt;
@@ -4965,7 +8942,7 @@ async function runGlobalAiCopilot(options = {}) {
           config: recoveryConfig,
           tabId: activeTab,
           userInput,
-          contextOverride,
+          contextOverride: runtimeContext,
         });
         if (requestId !== ui.copilotActiveRequestId) return;
         if (!retryAttempt.usedFallback) {
@@ -4993,7 +8970,7 @@ async function runGlobalAiCopilot(options = {}) {
       );
 
     if (shouldForcePdfRetry) {
-      const selectedPdfFile = str(buildGlobalCopilotContext(activeTab)?.selectedPdfFile) || "the selected PDF";
+      const selectedPdfFile = str(runtimeContext?.selectedPdfFile) || "the selected PDF";
       const pdfRetryPrompt = buildPdfFocusedRetryPrompt(activeTab, selectedPdfFile, userInput || input);
       const pdfRetryConfig = {
         ...effectiveConfig,
@@ -5007,6 +8984,7 @@ async function runGlobalAiCopilot(options = {}) {
         config: pdfRetryConfig,
         tabId: activeTab,
         userInput,
+        contextOverride: runtimeContext,
       });
       if (requestId !== ui.copilotActiveRequestId) return;
       if (
@@ -5043,6 +9021,7 @@ async function runGlobalAiCopilot(options = {}) {
         config: effectiveConfig,
         tabId: activeTab,
         userInput,
+        contextOverride: runtimeContext,
       });
       if (requestId !== ui.copilotActiveRequestId) return;
       if (!expansionAttempt.usedFallback && str(expansionAttempt.processed.text).length > str(finalAttempt.processed.text).length) {
@@ -5067,7 +9046,8 @@ async function runGlobalAiCopilot(options = {}) {
       nextConfig.model = recoveredWithModel;
       state.meta.aiConfig = nextConfig;
       saveState();
-      ui.copilotMessage = `Recovered reply using ${getAiModelDisplayName(recoveredWithModel)}. Default model switched to this one.`;
+      ui.copilotMessage = `Recovered reply using ${getAiModelDisplayName(recoveredWithModel)}. Default model switched to this one.${vaultContextSuffix}`;
+      ui.copilotMessage += aonContextSuffix;
     } else if (finalAttempt.usedFallback) {
       ui.copilotPendingFallbackMemory = !autoRun
         ? {
@@ -5092,6 +9072,7 @@ async function runGlobalAiCopilot(options = {}) {
       if (activeTab === "pdf") {
         ui.copilotMessage += " This fallback is generic and not grounded in PDF/book content.";
       }
+      ui.copilotMessage += aonContextSuffix;
     } else {
       ui.copilotPendingFallbackMemory = null;
       if (request.isChat) {
@@ -5101,6 +9082,8 @@ async function runGlobalAiCopilot(options = {}) {
           ? `Auto-generated ${getTabLabel(activeTab)} output.`
           : "Generated.";
       }
+      ui.copilotMessage += vaultContextSuffix;
+      ui.copilotMessage += aonContextSuffix;
     }
   } catch (err) {
     if (requestId !== ui.copilotActiveRequestId) return;
@@ -5218,6 +9201,12 @@ async function applyGlobalAiOutput() {
     render();
     return;
   }
+  if (activeTab === "hexmap") {
+    appendHexMapAiNote(text);
+    ui.copilotMessage = `Appended AI output to ${getHexMapSelectedHex()} notes.`;
+    render();
+    return;
+  }
   if (activeTab === "writing") {
     ui.writingDraft.output = text;
     ui.copilotMessage = "Sent AI output to Writing Helper.";
@@ -5237,6 +9226,11 @@ async function applyGlobalAiOutput() {
       await runPdfSearch(query, 20);
       return;
     }
+    render();
+    return;
+  }
+  if (activeTab === "obsidian") {
+    ui.copilotMessage = "No direct apply target on the Obsidian tab. Use Copy or Sync To Vault.";
     render();
     return;
   }
@@ -5989,7 +9983,259 @@ async function runWritingHelperWithLocalAi() {
   }
 }
 
+function normalizeAiMemoryState(rawMemory) {
+  const sourceCounts =
+    rawMemory?.sourceCounts && typeof rawMemory.sourceCounts === "object" && !Array.isArray(rawMemory.sourceCounts)
+      ? rawMemory.sourceCounts
+      : {};
+  return {
+    campaignSummary: str(rawMemory?.campaignSummary),
+    recentSessionSummary: str(rawMemory?.recentSessionSummary),
+    activeQuestsSummary: str(rawMemory?.activeQuestsSummary),
+    activeEntitiesSummary: str(rawMemory?.activeEntitiesSummary),
+    canonSummary: str(rawMemory?.canonSummary),
+    rulingsDigest: str(rawMemory?.rulingsDigest),
+    manualRulings: str(rawMemory?.manualRulings),
+    updatedAt: str(rawMemory?.updatedAt),
+    sourceCounts: {
+      sessions: Number.parseInt(String(sourceCounts.sessions || "0"), 10) || 0,
+      openQuests: Number.parseInt(String(sourceCounts.openQuests || "0"), 10) || 0,
+      npcs: Number.parseInt(String(sourceCounts.npcs || "0"), 10) || 0,
+      locations: Number.parseInt(String(sourceCounts.locations || "0"), 10) || 0,
+      ruleEntries: Number.parseInt(String(sourceCounts.ruleEntries || "0"), 10) || 0,
+      canonEntries: Number.parseInt(String(sourceCounts.canonEntries || "0"), 10) || 0,
+    },
+  };
+}
+
+function ensureAiMemoryState() {
+  if (!state?.meta) return normalizeAiMemoryState({});
+  state.meta.aiMemory = normalizeAiMemoryState(state.meta.aiMemory);
+  return state.meta.aiMemory;
+}
+
+function clipDigestText(value, limit = 560) {
+  const clean = str(value).replace(/\s+/g, " ").trim();
+  if (clean.length <= limit) return clean;
+  const sliced = clean.slice(0, limit);
+  const breakAt = Math.max(sliced.lastIndexOf(". "), sliced.lastIndexOf("; "), sliced.lastIndexOf(", "));
+  if (breakAt > Math.floor(limit * 0.6)) {
+    return `${sliced.slice(0, breakAt + 1).trim()} ...`;
+  }
+  return `${sliced.trim()}...`;
+}
+
+function normalizeRulesStoreEntry(rawEntry = {}) {
+  const kindRaw = str(rawEntry?.kind).toLowerCase();
+  const kind = Object.prototype.hasOwnProperty.call(RULE_STORE_KIND_LABELS, kindRaw) ? kindRaw : "accepted_ruling";
+  const text = str(rawEntry?.text || rawEntry?.body || rawEntry?.note).slice(0, 8000);
+  const titleSeed = str(rawEntry?.title || text.split(/\n+/)[0] || "").replace(/\s+/g, " ").trim();
+  const title = titleSeed || `${RULE_STORE_KIND_LABELS[kind]} ${formatAiHistoryTimestamp(rawEntry?.updatedAt || rawEntry?.createdAt) || ""}`.trim();
+  const tags = Array.isArray(rawEntry?.tags)
+    ? rawEntry.tags
+    : str(rawEntry?.tags)
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+  return {
+    id: str(rawEntry?.id) || `rule-store-${uid()}`,
+    title: title.slice(0, 180),
+    kind,
+    text,
+    sourceTitle: str(rawEntry?.sourceTitle || ""),
+    sourceUrl: str(rawEntry?.sourceUrl || ""),
+    sourceOrigin: str(rawEntry?.sourceOrigin || ""),
+    tags: [...new Set(tags.map((item) => str(item).toLowerCase()).filter(Boolean))].slice(0, 12),
+    createdAt: str(rawEntry?.createdAt) || new Date().toISOString(),
+    updatedAt: str(rawEntry?.updatedAt || rawEntry?.createdAt) || new Date().toISOString(),
+  };
+}
+
+function normalizeRulesStore(rawStore) {
+  return Array.isArray(rawStore) ? rawStore.map((entry) => normalizeRulesStoreEntry(entry)).filter((entry) => entry.text) : [];
+}
+
+function ensureRulesStore() {
+  state.rulesStore = normalizeRulesStore(state.rulesStore);
+  return state.rulesStore;
+}
+
+function getRuleStoreKindLabel(kind) {
+  return RULE_STORE_KIND_LABELS[str(kind).toLowerCase()] || "Saved Entry";
+}
+
+function buildRuleStoreTags({ title = "", text = "", kind = "" } = {}) {
+  const seeds = [str(title), str(text), str(kind)].join(" ");
+  return extractRetrievalTerms(seeds).slice(0, 8);
+}
+
+function upsertRulesStoreEntry(input = {}) {
+  const store = ensureRulesStore();
+  const normalized = normalizeRulesStoreEntry({
+    ...input,
+    tags: Array.isArray(input.tags) && input.tags.length ? input.tags : buildRuleStoreTags(input),
+  });
+  const titleKey = str(normalized.title).toLowerCase();
+  const kindKey = str(normalized.kind).toLowerCase();
+  const existing = store.find((entry) => str(entry.title).toLowerCase() === titleKey && str(entry.kind).toLowerCase() === kindKey);
+  if (existing) {
+    existing.text = normalized.text;
+    existing.sourceTitle = normalized.sourceTitle || existing.sourceTitle;
+    existing.sourceUrl = normalized.sourceUrl || existing.sourceUrl;
+    existing.sourceOrigin = normalized.sourceOrigin || existing.sourceOrigin;
+    existing.tags = [...new Set([...(existing.tags || []), ...(normalized.tags || [])])].slice(0, 12);
+    existing.updatedAt = new Date().toISOString();
+    return existing;
+  }
+  store.unshift(normalized);
+  state.rulesStore = normalizeRulesStore(store).slice(0, 240);
+  return normalized;
+}
+
+function deleteRulesStoreEntry(id) {
+  const targetId = str(id);
+  if (!targetId) return false;
+  const before = ensureRulesStore().length;
+  state.rulesStore = ensureRulesStore().filter((entry) => entry.id !== targetId);
+  return state.rulesStore.length !== before;
+}
+
+function buildAiMemoryDigests(sourceState = state) {
+  const working = sourceState || createStarterState();
+  const previousMemory = normalizeAiMemoryState(working?.meta?.aiMemory);
+  const sessions = [...(Array.isArray(working.sessions) ? working.sessions : [])].sort(
+    (a, b) => safeDate(b.date || b.updatedAt || b.createdAt) - safeDate(a.date || a.updatedAt || a.createdAt)
+  );
+  const latest = sessions[0] || null;
+  const openQuests = (Array.isArray(working.quests) ? working.quests : []).filter((q) => q.status !== "completed" && q.status !== "failed");
+  const npcs = Array.isArray(working.npcs) ? working.npcs : [];
+  const locations = Array.isArray(working.locations) ? working.locations : [];
+  const hexMap = working === state ? getHexMapState() : normalizeHexMapState(working.hexMap);
+  const party = getHexMapParty(hexMap);
+  const kingdom = working === state ? getKingdomState() : normalizeKingdomState(working.kingdom);
+  const recentRuleEntries = [...(Array.isArray(working.liveCapture) ? working.liveCapture : [])]
+    .filter((entry) => {
+      const kind = str(entry?.kind).toLowerCase();
+      return kind === "rule" || kind === "retcon";
+    })
+    .sort((a, b) => safeDate(b.timestamp) - safeDate(a.timestamp))
+    .slice(0, 6);
+  const rulesStore = working === state ? ensureRulesStore() : normalizeRulesStore(working.rulesStore);
+  const savedRuleEntries = rulesStore
+    .filter((entry) => entry.kind !== "canon_memory")
+    .sort((a, b) => safeDate(b.updatedAt || b.createdAt) - safeDate(a.updatedAt || a.createdAt))
+    .slice(0, 8);
+  const canonEntries = rulesStore
+    .filter((entry) => entry.kind === "canon_memory")
+    .sort((a, b) => safeDate(b.updatedAt || b.createdAt) - safeDate(a.updatedAt || a.createdAt))
+    .slice(0, 8);
+
+  const sessionHeadline = latest
+    ? `${latest.title || "Latest session"}: ${clipDigestText(latest.summary || latest.nextPrep || "No summary yet.", 240)}`
+    : "No sessions recorded yet.";
+  const pressureLine = openQuests.length
+    ? `Open pressure: ${openQuests
+        .slice(0, 4)
+        .map((quest) => `${quest.title}${quest.stakes ? ` (${clipDigestText(quest.stakes, 90)})` : ""}`)
+        .join("; ")}`
+    : "Open pressure: none tracked.";
+  const kingdomLine = kingdom?.name || kingdom?.currentTurnLabel || Number(kingdom?.level || 0) > 0
+    ? `Kingdom: ${kingdom.name || "Unnamed kingdom"} | Turn ${kingdom.currentTurnLabel || "not set"} | Control DC ${kingdom.controlDC} | Unrest ${kingdom.unrest} | Size ${kingdom.size}`
+    : "Kingdom: no active kingdom state.";
+  const mapLine = party?.hex
+    ? `Party position: ${party.hex} with ${Array.isArray(party.trail) ? party.trail.length : 0} trail point(s).`
+    : "Party position: not currently placed on the hex map.";
+  const campaignSummary = [sessionHeadline, pressureLine, kingdomLine, mapLine].join("\n");
+
+  const recentSessionSummary = sessions.length
+    ? sessions
+        .slice(0, 4)
+        .map((session, index) => `${index + 1}. ${session.title || "Session"}${session.date ? ` (${session.date})` : ""} - ${clipDigestText(session.summary || session.nextPrep || "No summary yet.", 180)}`)
+        .join("\n")
+    : "No recent sessions recorded.";
+
+  const activeQuestsSummary = openQuests.length
+    ? openQuests
+        .slice(0, 6)
+        .map((quest, index) => `${index + 1}. ${quest.title} - ${clipDigestText(quest.objective || quest.stakes || quest.giver || "No objective yet.", 160)}`)
+        .join("\n")
+    : "No active quests tracked.";
+
+  const latestNarrative = [latest?.summary, latest?.nextPrep, ...sessions.slice(0, 3).map((session) => session.summary || session.nextPrep || "")]
+    .map((item) => str(item))
+    .join(" ");
+  const mentionedNpcNames = findEntityMentions(latestNarrative, npcs, "name", 5);
+  const mentionedLocationNames = findEntityMentions(latestNarrative, locations, "name", 4);
+  const mentionedQuestTitles = findEntityMentions(latestNarrative, openQuests, "title", 4);
+  const fallbackNpcNames = [...npcs]
+    .sort((a, b) => safeDate(b.updatedAt || b.createdAt) - safeDate(a.updatedAt || a.createdAt))
+    .map((npc) => str(npc.name))
+    .filter(Boolean)
+    .slice(0, 5);
+  const fallbackLocationNames = [...locations]
+    .sort((a, b) => safeDate(b.updatedAt || b.createdAt) - safeDate(a.updatedAt || a.createdAt))
+    .map((location) => str(location.name))
+    .filter(Boolean)
+    .slice(0, 4);
+  const activeEntitiesSummary = [
+    `NPCs: ${(mentionedNpcNames.length ? mentionedNpcNames : fallbackNpcNames).join(", ") || "None tracked"}`,
+    `Locations: ${(mentionedLocationNames.length ? mentionedLocationNames : fallbackLocationNames).join(", ") || "None tracked"}`,
+    `Quests: ${mentionedQuestTitles.join(", ") || openQuests.slice(0, 4).map((quest) => quest.title).join(", ") || "None tracked"}`,
+  ].join("\n");
+
+  const derivedRulings = recentRuleEntries.length
+    ? recentRuleEntries
+        .map((entry, index) => `${index + 1}. ${clipDigestText(entry.note || "", 180)}`)
+        .join("\n")
+    : "No Rule or Retcon capture entries recorded yet.";
+  const savedRulingsDigest = savedRuleEntries.length
+    ? savedRuleEntries
+        .map((entry, index) => `${index + 1}. ${getRuleStoreKindLabel(entry.kind)}: ${clipDigestText(entry.text || entry.title || "", 180)}`)
+        .join("\n")
+    : "";
+  const rulingsDigest = previousMemory.manualRulings
+    ? clipDigestText(previousMemory.manualRulings, 2200)
+    : [savedRulingsDigest, derivedRulings].filter(Boolean).join("\n");
+  const canonSummary = canonEntries.length
+    ? canonEntries.map((entry, index) => `${index + 1}. ${entry.title} - ${clipDigestText(entry.text || "", 180)}`).join("\n")
+    : "No canon memory saved yet.";
+
+  return {
+    ...previousMemory,
+    campaignSummary,
+    recentSessionSummary,
+    activeQuestsSummary,
+    activeEntitiesSummary,
+    canonSummary,
+    rulingsDigest,
+    updatedAt: new Date().toISOString(),
+    sourceCounts: {
+      sessions: sessions.length,
+      openQuests: openQuests.length,
+      npcs: npcs.length,
+      locations: locations.length,
+      ruleEntries: recentRuleEntries.length + savedRuleEntries.length,
+      canonEntries: canonEntries.length,
+    },
+  };
+}
+
+function refreshAiMemoryDigests(options = {}) {
+  const nextMemory = buildAiMemoryDigests(state);
+  state.meta.aiMemory = nextMemory;
+  if (options.persist) {
+    saveState();
+  }
+  if (!options.silent) {
+    ui.dashboardMessage = `AI memory refreshed at ${nextMemory.updatedAt}.`;
+    render();
+  }
+  return nextMemory;
+}
+
 function collectAiCampaignContext() {
+  const aiMemory = buildAiMemoryDigests(state);
+  state.meta.aiMemory = aiMemory;
   const latest = getLatestSession();
   const kingdom = getKingdomState();
   const kingdomProfile = getActiveKingdomProfile();
@@ -6048,6 +10294,15 @@ function collectAiCampaignContext() {
       notes: l.notes,
     })),
     kingdom: buildKingdomAiContext(kingdom, kingdomProfile),
+    aiMemory: {
+      campaignSummary: aiMemory.campaignSummary,
+      recentSessionSummary: aiMemory.recentSessionSummary,
+      activeQuestsSummary: aiMemory.activeQuestsSummary,
+      activeEntitiesSummary: aiMemory.activeEntitiesSummary,
+      canonSummary: aiMemory.canonSummary,
+      rulingsDigest: aiMemory.rulingsDigest,
+      updatedAt: aiMemory.updatedAt,
+    },
     pdfIndexedFileCount: Number.parseInt(String(state?.meta?.pdfIndexedCount || indexedFiles.length || 0), 10) || 0,
     pdfIndexedFiles: indexedFiles.slice(0, 60),
     pdfSummaryBriefs: summaryBriefs,
@@ -6547,6 +10802,22 @@ function generateCopilotFallbackByTab(tabId, input) {
       "- Group notes by scene.",
       "- Mark unresolved hooks.",
       "- Push key entries into latest session log.",
+    ].join("\n");
+  }
+  if (tabId === "rules") {
+    return [
+      "Rules Answer:",
+      "- Review the selected official PF2e rule match first.",
+      "- Compare it against the local rulings digest before making a table ruling.",
+      "- If the official source and local digest conflict, state both clearly and choose one before play resumes.",
+      "",
+      "Official vs Local Notes:",
+      "- Official rule: confirm on the selected Archives of Nethys page.",
+      "- Local override: check the Manual Rulings Digest and recent Rule / Retcon captures.",
+      "",
+      "Source Trail:",
+      "- PF2e Rules tab search results",
+      "- Local Rulings Digest",
     ].join("\n");
   }
   if (tabId === "kingdom") {
@@ -7130,7 +11401,7 @@ function slugify(value) {
 }
 
 async function handleFormSubmit(type, form) {
-  const fields = Object.fromEntries(new FormData(form).entries());
+  const fields = getFormFields(form);
 
   if (type === "sessions") {
     state.sessions.unshift({
@@ -7181,6 +11452,111 @@ async function handleFormSubmit(type, form) {
     saveState();
     form.reset();
     ui.kingdomMessage = "Region record added.";
+    render();
+    return;
+  }
+
+  if (type === "hexmap-settings") {
+    applyHexMapSettings(fields);
+    saveState();
+    ui.hexMapMessage = "Hex map settings updated.";
+    render();
+    return;
+  }
+
+  if (type === "obsidian-settings") {
+    const settings = ensureObsidianSettings();
+    settings.vaultPath = str(fields.vaultPath);
+    settings.baseFolder = str(fields.baseFolder) || "DM Helper";
+    settings.aiWriteFolder = str(fields.aiWriteFolder) || "AI Notes";
+    settings.useForAiContext = fields.useForAiContext === "on";
+    settings.readWholeVault = fields.readWholeVault === "on";
+    settings.aiContextNoteLimit = Math.max(1, Math.min(12, Number.parseInt(String(fields.aiContextNoteLimit || settings.aiContextNoteLimit || 6), 10) || 6));
+    settings.aiContextCharLimit = Math.max(
+      800,
+      Math.min(12000, Number.parseInt(String(fields.aiContextCharLimit || settings.aiContextCharLimit || 3600), 10) || 3600)
+    );
+    saveState();
+    ui.obsidianMessage = "Obsidian vault settings saved.";
+    render();
+    return;
+  }
+
+  if (type === "ai-memory-rulings") {
+    const aiMemory = ensureAiMemoryState();
+    aiMemory.manualRulings = str(fields.manualRulings);
+    state.meta.aiMemory = buildAiMemoryDigests(state);
+    saveState();
+    ui.dashboardMessage = "Manual rulings digest saved.";
+    ui.rulesMessage = "Manual rulings digest saved.";
+    render();
+    return;
+  }
+
+  if (type === "rules-store-entry") {
+    const text = str(fields.text);
+    if (!text) {
+      ui.rulesMessage = "Add some text before saving a local rule or canon entry.";
+      render();
+      return;
+    }
+    const entry = upsertRulesStoreEntry({
+      title: str(fields.title),
+      kind: str(fields.kind),
+      text,
+      sourceUrl: str(fields.sourceUrl),
+      sourceOrigin: "manual",
+    });
+    state.meta.aiMemory = buildAiMemoryDigests(state);
+    saveState();
+    form.reset();
+    ui.rulesMessage = `Saved ${getRuleStoreKindLabel(entry.kind).toLowerCase()}: ${entry.title}.`;
+    render();
+    return;
+  }
+
+  if (type === "rules-search") {
+    ui.rulesSearchQuery = normalizeRulesSearchQuery(fields.query);
+    ui.rulesSearchLimit = Math.max(1, Math.min(6, Number.parseInt(String(fields.limit || ui.rulesSearchLimit || 5), 10) || 5));
+    ui.rulesScope = ["both", "official", "local"].includes(str(fields.scope)) ? str(fields.scope) : "both";
+    await runRulesSearch(ui.rulesSearchQuery, ui.rulesSearchLimit, false);
+    return;
+  }
+
+  if (type === "hexmap-region") {
+    const record = upsertHexMapRegion(fields);
+    setHexMapSelectedHex(record.hex);
+    saveState();
+    ui.hexMapMessage = `Saved hex record for ${record.hex}.`;
+    render();
+    return;
+  }
+
+  if (type === "hexmap-marker") {
+    const marker = createHexMapMarker(fields);
+    setHexMapSelectedHex(marker.hex);
+    saveState();
+    form.reset();
+    ui.hexMapMessage = `Added ${marker.type.toLowerCase()} marker to ${marker.hex}.`;
+    render();
+    return;
+  }
+
+  if (type === "hexmap-force") {
+    const force = createHexMapForce(fields);
+    setHexMapSelectedHex(force.hex);
+    saveState();
+    form.reset();
+    ui.hexMapMessage = `Added ${force.type.toLowerCase()} to ${force.hex}.`;
+    render();
+    return;
+  }
+
+  if (type === "hexmap-party") {
+    const party = upsertHexMapParty(fields);
+    setHexMapSelectedHex(party.hex);
+    saveState();
+    ui.hexMapMessage = `${party.label || "Party"} moved to ${party.hex}.`;
     render();
     return;
   }
@@ -7316,6 +11692,8 @@ function getEntityCollectionRef(collection) {
   if (clean === "kingdomSettlements") return getKingdomState().settlements;
   if (clean === "kingdomRegions") return getKingdomState().regions;
   if (clean === "kingdomTurns") return getKingdomState().turns;
+  if (clean === "hexMapMarkers") return getHexMapState().markers;
+  if (clean === "hexMapForces") return getHexMapState().forces;
   return Array.isArray(state[clean]) ? state[clean] : null;
 }
 
@@ -7329,6 +11707,18 @@ function normalizeEntityPatch(collection, patch) {
     }
     if (cleanCollection === "kingdomSettlements" && ["influence", "resourceDice", "consumption"].includes(field)) {
       out[field] = Math.max(0, Number.parseInt(String(value || "0"), 10) || 0);
+      continue;
+    }
+    if ((cleanCollection === "kingdomRegions" || cleanCollection === "hexMapMarkers" || cleanCollection === "hexMapForces") && field === "hex") {
+      out[field] = normalizeHexCoordinate(value) || str(value);
+      continue;
+    }
+    if (cleanCollection === "hexMapMarkers" && field === "type") {
+      out[field] = HEX_MAP_MARKER_TYPES.includes(str(value)) ? str(value) : "Note";
+      continue;
+    }
+    if (cleanCollection === "hexMapForces" && field === "type") {
+      out[field] = HEX_MAP_FORCE_TYPES.includes(str(value)) ? str(value) : "Allied Force";
       continue;
     }
     out[field] = value;
@@ -7359,6 +11749,9 @@ function patchEntity(collection, id, patch) {
   if (!item) return;
   Object.assign(item, normalizeEntityPatch(collection, patch), { updatedAt: new Date().toISOString() });
   saveState();
+  if (activeTab === "hexmap" && (collection === "hexMapMarkers" || collection === "hexMapForces" || collection === "kingdomRegions")) {
+    render();
+  }
 }
 
 function getPdfSummaryMap() {
@@ -7366,6 +11759,54 @@ function getPdfSummaryMap() {
     state.meta.pdfSummaries = {};
   }
   return state.meta.pdfSummaries;
+}
+
+async function runRulesSearch(query, limit = 5, force = false) {
+  const cleanQuery = normalizeRulesSearchQuery(query);
+  ui.rulesSearchQuery = cleanQuery;
+  ui.rulesSearchLimit = Math.max(1, Math.min(6, Number.parseInt(String(limit || ui.rulesSearchLimit || 5), 10) || 5));
+
+  if (!cleanQuery) {
+    ui.rulesResults = [];
+    ui.rulesSelectedUrl = "";
+    ui.rulesMessage = "Type a PF2e rule term first.";
+    render();
+    return;
+  }
+
+  if (!desktopApi?.searchAonRules) {
+    ui.rulesResults = [];
+    ui.rulesSelectedUrl = "";
+    ui.rulesMessage = "Official PF2e rules lookup is only available in the desktop runtime.";
+    render();
+    return;
+  }
+
+  ui.rulesBusy = true;
+  ui.rulesMessage = force
+    ? `Refreshing official PF2e rules for "${cleanQuery}"...`
+    : `Searching official PF2e rules for "${cleanQuery}"...`;
+  render();
+  try {
+    const result = await desktopApi.searchAonRules({
+      query: cleanQuery,
+      limit: ui.rulesSearchLimit,
+      force: force === true,
+    });
+    ui.rulesResults = sortRulesResults(cleanQuery, Array.isArray(result?.results) ? result.results : []);
+    ui.rulesSelectedUrl = str(ui.rulesResults[0]?.url || "");
+    ui.rulesIndexedAt = str(result?.indexedAt || "");
+    ui.rulesMessage = ui.rulesResults.length
+      ? `Loaded ${ui.rulesResults.length} official PF2e rule match(es) for "${cleanQuery}".`
+      : `No official PF2e rule matches found for "${cleanQuery}".`;
+  } catch (err) {
+    ui.rulesResults = [];
+    ui.rulesSelectedUrl = "";
+    ui.rulesMessage = `Official rules lookup failed: ${readableError(err)}`;
+  } finally {
+    ui.rulesBusy = false;
+    render();
+  }
 }
 
 function syncPdfSummarySelection() {
@@ -7512,6 +11953,460 @@ async function choosePdfFolder() {
     ui.pdfMessage = `Failed to choose folder: ${String(err)}`;
     render();
   }
+}
+
+async function chooseHexMapBackground() {
+  if (!desktopApi?.pickMapBackground) {
+    ui.hexMapMessage = "Map background picker is only available in the desktop build.";
+    render();
+    return;
+  }
+  try {
+    const picked = await desktopApi.pickMapBackground();
+    if (!picked?.fileUrl) return;
+    const imageMeta = await loadImageMetadata(picked.fileUrl);
+    const hexMap = getHexMapState();
+    hexMap.backgroundPath = str(picked.path);
+    hexMap.backgroundUrl = str(picked.fileUrl);
+    hexMap.backgroundName = str(picked.name) || str(picked.path).split(/[\\/]/).pop() || "Map background";
+    hexMap.backgroundNaturalWidth = Math.max(0, Number.parseFloat(String(imageMeta?.width || "0")) || 0);
+    hexMap.backgroundNaturalHeight = Math.max(0, Number.parseFloat(String(imageMeta?.height || "0")) || 0);
+    hexMap.backgroundScale = 1;
+    hexMap.backgroundOffsetX = 0;
+    hexMap.backgroundOffsetY = 0;
+    saveState();
+    ui.hexMapMessage = `Loaded map background: ${hexMap.backgroundName}. Adjust scale and offsets until the overlay hexes line up with the printed map.`;
+    render();
+  } catch (err) {
+    ui.hexMapMessage = `Background load failed: ${readableError(err)}`;
+    render();
+  }
+}
+
+function ensureObsidianSettings() {
+  if (!state?.meta?.obsidian || typeof state.meta.obsidian !== "object" || Array.isArray(state.meta.obsidian)) {
+    state.meta.obsidian = {
+      vaultPath: "",
+      baseFolder: "DM Helper",
+      lastSyncAt: "",
+      lastSyncSummary: "",
+      looksLikeVault: false,
+      useForAiContext: true,
+      readWholeVault: true,
+      aiContextNoteLimit: 6,
+      aiContextCharLimit: 3600,
+      aiWriteFolder: "AI Notes",
+      lastAiNoteAt: "",
+      lastAiNotePath: "",
+    };
+  }
+  state.meta.obsidian.vaultPath = str(state.meta.obsidian.vaultPath);
+  state.meta.obsidian.baseFolder = str(state.meta.obsidian.baseFolder) || "DM Helper";
+  state.meta.obsidian.lastSyncAt = str(state.meta.obsidian.lastSyncAt);
+  state.meta.obsidian.lastSyncSummary = str(state.meta.obsidian.lastSyncSummary);
+  state.meta.obsidian.looksLikeVault = state.meta.obsidian.looksLikeVault === true;
+  state.meta.obsidian.useForAiContext = state.meta.obsidian.useForAiContext !== false;
+  state.meta.obsidian.readWholeVault = state.meta.obsidian.readWholeVault !== false;
+  state.meta.obsidian.aiContextNoteLimit = Math.max(1, Math.min(12, Number.parseInt(String(state.meta.obsidian.aiContextNoteLimit || 6), 10) || 6));
+  state.meta.obsidian.aiContextCharLimit = Math.max(800, Math.min(12000, Number.parseInt(String(state.meta.obsidian.aiContextCharLimit || 3600), 10) || 3600));
+  state.meta.obsidian.aiWriteFolder = str(state.meta.obsidian.aiWriteFolder) || "AI Notes";
+  state.meta.obsidian.lastAiNoteAt = str(state.meta.obsidian.lastAiNoteAt);
+  state.meta.obsidian.lastAiNotePath = str(state.meta.obsidian.lastAiNotePath);
+  return state.meta.obsidian;
+}
+
+async function buildCopilotRuntimeContext(tabId, userInput, options = {}) {
+  const baseContext = options?.baseContext || buildGlobalCopilotContext(tabId);
+  const route = options?.route || null;
+  const aiConfig = ensureAiConfig();
+  const taskContext = {
+    taskType: str(route?.taskType || baseContext?.taskType),
+    taskLabel: str(route?.taskLabel || baseContext?.taskLabel),
+    taskSaveTarget: str(route?.saveTarget || baseContext?.taskSaveTarget),
+    routeReason: str(route?.routeReason || baseContext?.routeReason),
+    entityType: str(route?.entityType || baseContext?.entityType),
+  };
+  let runtimeContext = {
+    ...baseContext,
+    ...taskContext,
+    aonRulesEnabled: false,
+    aonRulesMatches: Array.isArray(baseContext?.aonRulesMatches) ? baseContext.aonRulesMatches : [],
+  };
+
+  if (options?.skipVault) {
+    if (
+      aiConfig.useAonRules &&
+      taskContext.taskType === "rules_question" &&
+      desktopApi?.searchAonRules
+    ) {
+      try {
+        const aonResult = await desktopApi.searchAonRules({ query: str(userInput), limit: aiConfig.compactContext ? 3 : 4 });
+        runtimeContext.aonRulesMatches = Array.isArray(aonResult?.results) ? aonResult.results : [];
+        runtimeContext.aonRulesEnabled = runtimeContext.aonRulesMatches.length > 0;
+      } catch {
+        runtimeContext.aonRulesEnabled = false;
+      }
+    }
+    const retrieval = buildUnifiedRetrievalContext({
+      tabId,
+      userInput,
+      route,
+      baseContext: runtimeContext,
+      obsidianNotes: [],
+    });
+    return {
+      ...runtimeContext,
+      ...retrieval,
+    };
+  }
+  const settings = ensureObsidianSettings();
+  if (!settings.useForAiContext || !settings.vaultPath || !desktopApi?.getObsidianVaultContext) {
+    if (
+      aiConfig.useAonRules &&
+      taskContext.taskType === "rules_question" &&
+      desktopApi?.searchAonRules
+    ) {
+      try {
+        const aonResult = await desktopApi.searchAonRules({ query: str(userInput), limit: aiConfig.compactContext ? 3 : 4 });
+        runtimeContext.aonRulesMatches = Array.isArray(aonResult?.results) ? aonResult.results : [];
+        runtimeContext.aonRulesEnabled = runtimeContext.aonRulesMatches.length > 0;
+      } catch {
+        runtimeContext.aonRulesEnabled = false;
+      }
+    }
+    const retrieval = buildUnifiedRetrievalContext({
+      tabId,
+      userInput,
+      route,
+      baseContext: runtimeContext,
+      obsidianNotes: [],
+    });
+    return {
+      ...runtimeContext,
+      obsidianContextEnabled: settings.useForAiContext && !!settings.vaultPath,
+      ...retrieval,
+    };
+  }
+  try {
+    const result = await desktopApi.getObsidianVaultContext({
+      vaultPath: settings.vaultPath,
+      baseFolder: settings.baseFolder,
+      readWholeVault: settings.readWholeVault,
+      maxNotes: settings.aiContextNoteLimit,
+      maxChars: settings.aiContextCharLimit,
+      query: str(userInput),
+      activeTab: tabId,
+    });
+    runtimeContext = {
+      ...runtimeContext,
+      obsidianContextEnabled: true,
+      obsidianContext: str(result?.summary),
+      obsidianVaultNotes: Array.isArray(result?.notes) ? result.notes.slice(0, settings.aiContextNoteLimit) : [],
+      obsidianContextNoteCount: Number(result?.notes?.length || 0),
+      obsidianContextSourceRoot: str(result?.sourceRoot),
+      obsidianContextLooksLikeVault: result?.looksLikeVault === true,
+    };
+    if (
+      aiConfig.useAonRules &&
+      taskContext.taskType === "rules_question" &&
+      desktopApi?.searchAonRules
+    ) {
+      try {
+        const aonResult = await desktopApi.searchAonRules({ query: str(userInput), limit: aiConfig.compactContext ? 3 : 4 });
+        runtimeContext.aonRulesMatches = Array.isArray(aonResult?.results) ? aonResult.results : [];
+        runtimeContext.aonRulesEnabled = runtimeContext.aonRulesMatches.length > 0;
+      } catch {
+        runtimeContext.aonRulesEnabled = false;
+      }
+    }
+    const retrieval = buildUnifiedRetrievalContext({
+      tabId,
+      userInput,
+      route,
+      baseContext: runtimeContext,
+      obsidianNotes: runtimeContext.obsidianVaultNotes,
+    });
+    return {
+      ...runtimeContext,
+      ...retrieval,
+    };
+  } catch (err) {
+    ui.obsidianMessage = `Vault AI read failed: ${readableError(err)}`;
+    if (
+      aiConfig.useAonRules &&
+      taskContext.taskType === "rules_question" &&
+      desktopApi?.searchAonRules
+    ) {
+      try {
+        const aonResult = await desktopApi.searchAonRules({ query: str(userInput), limit: aiConfig.compactContext ? 3 : 4 });
+        runtimeContext.aonRulesMatches = Array.isArray(aonResult?.results) ? aonResult.results : [];
+        runtimeContext.aonRulesEnabled = runtimeContext.aonRulesMatches.length > 0;
+      } catch {
+        runtimeContext.aonRulesEnabled = false;
+      }
+    }
+    const retrieval = buildUnifiedRetrievalContext({
+      tabId,
+      userInput,
+      route,
+      baseContext: runtimeContext,
+      obsidianNotes: [],
+    });
+    return {
+      ...runtimeContext,
+      obsidianContextEnabled: false,
+      ...retrieval,
+    };
+  }
+}
+
+function buildObsidianAiNoteTitle() {
+  const firstLine = str(ui.copilotDraft.input).split(/\r?\n/).find((line) => str(line).trim()) || "";
+  const basis = firstLine || `${getTabLabel(activeTab)} AI Output`;
+  const compact = basis.replace(/\s+/g, " ").trim();
+  const clipped = compact.length > 72 ? `${compact.slice(0, 72).trim()}...` : compact;
+  return `${getTabLabel(activeTab)} - ${clipped || "AI Output"}`;
+}
+
+async function writeCurrentAiOutputToObsidian() {
+  const text = str(ui.copilotDraft.output);
+  if (!text) {
+    ui.copilotMessage = "No Loremaster output to write to the vault.";
+    render();
+    return;
+  }
+  const settings = ensureObsidianSettings();
+  if (!settings.vaultPath) {
+    ui.copilotMessage = "Choose your Obsidian vault folder first.";
+    render();
+    return;
+  }
+  if (!desktopApi?.writeObsidianAiNote) {
+    ui.copilotMessage = "Vault note writing is only available in the desktop build.";
+    render();
+    return;
+  }
+  ui.obsidianBusy = true;
+  ui.copilotMessage = "Writing current Loremaster output to the Obsidian vault...";
+  render();
+  try {
+    const result = await desktopApi.writeObsidianAiNote({
+      vaultPath: settings.vaultPath,
+      baseFolder: settings.baseFolder,
+      noteFolder: settings.aiWriteFolder,
+      title: buildObsidianAiNoteTitle(),
+      prompt: str(ui.copilotDraft.input),
+      content: text,
+      sourceTab: getTabLabel(activeTab),
+      model: ensureAiConfig().model,
+      generatedAt: new Date().toISOString(),
+    });
+    settings.lastAiNoteAt = str(result?.writtenAt) || new Date().toISOString();
+    settings.lastAiNotePath = str(result?.relativePath);
+    saveState();
+    ui.obsidianMessage = result?.summary || "AI output written to the vault.";
+    ui.copilotMessage = result?.summary || "Wrote current AI output to the vault.";
+  } catch (err) {
+    const message = readableError(err);
+    ui.obsidianMessage = `Vault note write failed: ${message}`;
+    ui.copilotMessage = `Vault note write failed: ${message}`;
+  } finally {
+    ui.obsidianBusy = false;
+    render();
+  }
+}
+
+function buildObsidianSyncPayload() {
+  const settings = ensureObsidianSettings();
+  const profile = getActiveKingdomProfile();
+  const kingdom = getKingdomState();
+  const hexMap = getHexMapState();
+  const party = getHexMapParty(hexMap);
+  return {
+    vaultPath: settings.vaultPath,
+    baseFolder: settings.baseFolder,
+    campaignName: str(state?.meta?.campaignName) || "DM Helper Campaign",
+    generatedAt: new Date().toISOString(),
+    sessions: (state.sessions || []).map((session) => ({
+      title: str(session.title),
+      date: str(session.date),
+      arc: str(session.arc),
+      kingdomTurn: str(session.kingdomTurn),
+      summary: str(session.summary),
+      nextPrep: str(session.nextPrep),
+      updatedAt: str(session.updatedAt || session.createdAt),
+    })),
+    npcs: (state.npcs || []).map((npc) => ({
+      name: str(npc.name),
+      role: str(npc.role),
+      agenda: str(npc.agenda),
+      disposition: str(npc.disposition),
+      folder: str(npc.folder),
+      notes: str(npc.notes),
+      updatedAt: str(npc.updatedAt || npc.createdAt),
+    })),
+    quests: (state.quests || []).map((quest) => ({
+      title: str(quest.title),
+      status: str(quest.status),
+      objective: str(quest.objective),
+      giver: str(quest.giver),
+      folder: str(quest.folder),
+      stakes: str(quest.stakes),
+      updatedAt: str(quest.updatedAt || quest.createdAt),
+    })),
+    locations: (state.locations || []).map((location) => ({
+      name: str(location.name),
+      hex: str(location.hex),
+      folder: str(location.folder),
+      whatChanged: str(location.whatChanged),
+      notes: str(location.notes),
+      updatedAt: str(location.updatedAt || location.createdAt),
+    })),
+    kingdom: {
+      profileLabel: str(profile?.label || profile?.shortLabel),
+      name: str(kingdom.name),
+      charter: str(kingdom.charter),
+      government: str(kingdom.government),
+      heartland: str(kingdom.heartland),
+      currentTurnLabel: str(kingdom.currentTurnLabel),
+      currentDate: str(kingdom.currentDate),
+      level: Number(kingdom.level || 0),
+      size: Number(kingdom.size || 0),
+      controlDC: Number(kingdom.controlDC || 0),
+      resourcePoints: Number(kingdom.resourcePoints || 0),
+      culture: Number(kingdom.culture || 0),
+      economy: Number(kingdom.economy || 0),
+      loyalty: Number(kingdom.loyalty || 0),
+      stability: Number(kingdom.stability || 0),
+      unrest: Number(kingdom.unrest || 0),
+      fame: Number(kingdom.fame || 0),
+      infamy: Number(kingdom.infamy || 0),
+      notes: str(kingdom.notes),
+      leaders: (kingdom.leaders || []).map((leader) => ({
+        role: str(leader.role),
+        name: str(leader.name),
+        ability: str(leader.ability),
+        leadershipBonus: Number(leader.leadershipBonus || 0),
+        notes: str(leader.notes),
+      })),
+      settlements: (kingdom.settlements || []).map((settlement) => ({
+        name: str(settlement.name),
+        size: str(settlement.size),
+        influence: Number(settlement.influence || 0),
+        civicStructure: str(settlement.civicStructure),
+        resourceDice: Number(settlement.resourceDice || 0),
+        consumption: Number(settlement.consumption || 0),
+        notes: str(settlement.notes),
+      })),
+      regions: (kingdom.regions || []).map((region) => ({
+        hex: str(region.hex),
+        status: str(region.status),
+        terrain: str(region.terrain),
+        workSite: str(region.workSite),
+        notes: str(region.notes),
+      })),
+      turns: [...(kingdom.turns || [])].slice(-12).map((turn) => ({
+        title: str(turn.title),
+        date: str(turn.date),
+        summary: str(turn.summary),
+        resourceDelta: Number(turn.resourceDelta || 0),
+        unrestDelta: Number(turn.unrestDelta || 0),
+        notes: str(turn.notes),
+      })),
+    },
+    hexMap: {
+      mapName: str(hexMap.mapName),
+      backgroundName: str(hexMap.backgroundName),
+      party,
+      forces: (hexMap.forces || []).map((force) => ({
+        type: str(force.type),
+        name: str(force.name),
+        hex: str(force.hex),
+        notes: str(force.notes),
+      })),
+      markers: (hexMap.markers || []).map((marker) => ({
+        type: str(marker.type),
+        title: str(marker.title),
+        hex: str(marker.hex),
+        notes: str(marker.notes),
+      })),
+    },
+    liveCapture: [...(state.liveCapture || [])].slice(-30).map((entry) => ({
+      sessionId: str(entry.sessionId),
+      kind: str(entry.kind),
+      note: str(entry.note),
+      timestamp: str(entry.timestamp),
+    })),
+  };
+}
+
+async function chooseObsidianVault() {
+  if (!desktopApi?.pickObsidianVault) {
+    ui.obsidianMessage = "Vault picker is only available in the desktop build.";
+    render();
+    return;
+  }
+  try {
+    const selected = await desktopApi.pickObsidianVault();
+    if (!selected?.path) return;
+    const settings = ensureObsidianSettings();
+    settings.vaultPath = str(selected.path);
+    settings.looksLikeVault = selected.looksLikeVault === true;
+    saveState();
+    ui.obsidianMessage = settings.looksLikeVault
+      ? `Vault selected: ${settings.vaultPath}`
+      : `Folder selected: ${settings.vaultPath}. It does not look like an Obsidian vault yet, but sync can still write markdown there.`;
+    render();
+  } catch (err) {
+    ui.obsidianMessage = `Failed to choose vault: ${readableError(err)}`;
+    render();
+  }
+}
+
+async function syncObsidianVault() {
+  if (!desktopApi?.syncObsidianVault) {
+    ui.obsidianMessage = "Obsidian sync is only available in the desktop build.";
+    render();
+    return;
+  }
+  const settings = ensureObsidianSettings();
+  if (!settings.vaultPath) {
+    ui.obsidianMessage = "Choose your Obsidian vault folder first.";
+    render();
+    return;
+  }
+  ui.obsidianBusy = true;
+  ui.obsidianMessage = "Syncing markdown notes into the Obsidian vault...";
+  render();
+  try {
+    const result = await desktopApi.syncObsidianVault(buildObsidianSyncPayload());
+    settings.looksLikeVault = result?.looksLikeVault === true;
+    settings.lastSyncAt = str(result?.syncedAt) || new Date().toISOString();
+    settings.lastSyncSummary = str(result?.summary || "");
+    saveState();
+    ui.obsidianMessage = result?.summary
+      ? `${result.summary} Notes written to ${result.rootFolder}.`
+      : `Synced notes to ${result?.rootFolder || settings.vaultPath}.`;
+  } catch (err) {
+    ui.obsidianMessage = `Vault sync failed: ${readableError(err)}`;
+  } finally {
+    ui.obsidianBusy = false;
+    render();
+  }
+}
+
+function loadImageMetadata(fileUrl) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      resolve({
+        width: image.naturalWidth || 0,
+        height: image.naturalHeight || 0,
+      });
+    };
+    image.onerror = () => reject(new Error("Could not read the selected image."));
+    image.src = fileUrl;
+  });
 }
 
 async function indexPdfLibrary() {
@@ -7717,6 +12612,9 @@ function loadState() {
 }
 
 function saveState() {
+  if (state?.meta) {
+    state.meta.aiMemory = buildAiMemoryDigests(state);
+  }
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
@@ -7817,6 +12715,7 @@ function normalizeState(input) {
           compactContext: out.meta.aiConfig.compactContext === false ? false : true,
           autoRunTabs: out.meta.aiConfig.autoRunTabs === false ? false : true,
           usePdfContext: out.meta.aiConfig.usePdfContext === false ? false : true,
+          useAonRules: out.meta.aiConfig.useAonRules === false ? false : true,
           aiProfile: ["fast", "deep", "custom"].includes(str(out.meta.aiConfig.aiProfile).toLowerCase())
             ? str(out.meta.aiConfig.aiProfile).toLowerCase()
             : "fast",
@@ -7830,6 +12729,7 @@ function normalizeState(input) {
           compactContext: true,
           autoRunTabs: true,
           usePdfContext: true,
+          useAonRules: true,
           aiProfile: "fast",
         };
   if (!Array.isArray(out.meta.aiHistory)) {
@@ -7856,6 +12756,38 @@ function normalizeState(input) {
       locations: Array.isArray(out.meta.worldFolders.locations) ? out.meta.worldFolders.locations : [],
     };
   }
+  out.meta.obsidian =
+    out.meta.obsidian && typeof out.meta.obsidian === "object" && !Array.isArray(out.meta.obsidian)
+      ? {
+          vaultPath: str(out.meta.obsidian.vaultPath),
+          baseFolder: str(out.meta.obsidian.baseFolder) || "DM Helper",
+          lastSyncAt: str(out.meta.obsidian.lastSyncAt),
+          lastSyncSummary: str(out.meta.obsidian.lastSyncSummary),
+          looksLikeVault: out.meta.obsidian.looksLikeVault === true,
+          useForAiContext: out.meta.obsidian.useForAiContext !== false,
+          readWholeVault: out.meta.obsidian.readWholeVault !== false,
+          aiContextNoteLimit: Math.max(1, Math.min(12, Number.parseInt(String(out.meta.obsidian.aiContextNoteLimit || 6), 10) || 6)),
+          aiContextCharLimit: Math.max(800, Math.min(12000, Number.parseInt(String(out.meta.obsidian.aiContextCharLimit || 3600), 10) || 3600)),
+          aiWriteFolder: str(out.meta.obsidian.aiWriteFolder) || "AI Notes",
+          lastAiNoteAt: str(out.meta.obsidian.lastAiNoteAt),
+          lastAiNotePath: str(out.meta.obsidian.lastAiNotePath),
+        }
+      : {
+          vaultPath: "",
+          baseFolder: "DM Helper",
+          lastSyncAt: "",
+          lastSyncSummary: "",
+          looksLikeVault: false,
+          useForAiContext: true,
+          readWholeVault: true,
+          aiContextNoteLimit: 6,
+          aiContextCharLimit: 3600,
+          aiWriteFolder: "AI Notes",
+          lastAiNoteAt: "",
+          lastAiNotePath: "",
+        };
+  out.meta.aiMemory = normalizeAiMemoryState(out.meta.aiMemory);
+  out.rulesStore = normalizeRulesStore(out.rulesStore);
   out.kingdom = normalizeKingdomState(out.kingdom);
   out.sessions = Array.isArray(out.sessions) ? out.sessions : [];
   out.npcs = Array.isArray(out.npcs) ? out.npcs : [];
@@ -7865,6 +12797,7 @@ function normalizeState(input) {
   out.quests = out.quests.map((item) => ({ ...item, folder: normalizeWorldFolderName(item?.folder) }));
   out.locations = out.locations.map((item) => ({ ...item, folder: normalizeWorldFolderName(item?.folder) }));
   out.liveCapture = Array.isArray(out.liveCapture) ? out.liveCapture : [];
+  out.hexMap = normalizeHexMapState(out.hexMap);
   return out;
 }
 
@@ -7893,6 +12826,7 @@ function createStarterState() {
         compactContext: true,
         autoRunTabs: true,
         usePdfContext: true,
+        useAonRules: true,
         aiProfile: "fast",
       },
       aiHistory: [],
@@ -7901,7 +12835,40 @@ function createStarterState() {
         quests: ["Main Arc", "Waystation"],
         locations: ["Capital", "Frontier"],
       },
+      obsidian: {
+        vaultPath: "",
+        baseFolder: "DM Helper",
+        lastSyncAt: "",
+        lastSyncSummary: "",
+        looksLikeVault: false,
+        useForAiContext: true,
+        readWholeVault: true,
+        aiContextNoteLimit: 6,
+        aiContextCharLimit: 3600,
+        aiWriteFolder: "AI Notes",
+        lastAiNoteAt: "",
+        lastAiNotePath: "",
+      },
+      aiMemory: {
+        campaignSummary: "",
+        recentSessionSummary: "",
+        activeQuestsSummary: "",
+        activeEntitiesSummary: "",
+        canonSummary: "",
+        rulingsDigest: "",
+        manualRulings: "",
+        updatedAt: "",
+        sourceCounts: {
+          sessions: 0,
+          openQuests: 0,
+          npcs: 0,
+          locations: 0,
+          ruleEntries: 0,
+          canonEntries: 0,
+        },
+      },
     },
+    rulesStore: [],
     sessions: [
       {
         id: uid(),
@@ -7986,6 +12953,7 @@ function createStarterState() {
       },
     ],
     kingdom: createStarterKingdomState(),
+    hexMap: createStarterHexMapState(),
     liveCapture: [],
   };
 }
@@ -8042,6 +13010,16 @@ function safeDate(value) {
 
 function dateStamp() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function formatTimestamp(value) {
+  const ms = safeDate(value);
+  if (!ms) return "";
+  try {
+    return new Date(ms).toLocaleString();
+  } catch {
+    return str(value);
+  }
 }
 
 function readableError(err) {

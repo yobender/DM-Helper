@@ -74,6 +74,115 @@
         "Kingdom creation gains an extra free ability boost, bringing the free boosts at creation to three.",
         "Instead of each invested leader choosing a trained skill during creation, the kingdom selects four additional trained skills directly, for a total of ten trained skills at the start."
       ],
+      "creationReference": {
+        "sourceNote": "Official charter, heartland, and government details summarized from Kingmaker Appendix 2. The V&K profile then adds its own creation-layer changes on top of those baseline choices.",
+        "finalizeAbilityBoosts": 3,
+        "charterFreeSkillChoices": 1,
+        "heartlandFreeSkillChoices": 1,
+        "additionalTrainedSkills": 4,
+        "charters": [
+          {
+            "name": "Conquest Charter",
+            "summary": "You are installed over recently conquered land and expected to hold it for your patron.",
+            "abilityBoosts": ["Loyalty", "One free ability boost"],
+            "abilityFlaw": "Culture"
+          },
+          {
+            "name": "Expansion Charter",
+            "summary": "You govern land next to an allied nation that expects loyalty and close ties.",
+            "abilityBoosts": ["Culture", "One free ability boost"],
+            "abilityFlaw": "Stability"
+          },
+          {
+            "name": "Exploration Charter",
+            "summary": "You are expected to explore, clear, and settle new wilderness with sponsor support.",
+            "abilityBoosts": ["Stability", "One free ability boost"],
+            "abilityFlaw": "Economy"
+          },
+          {
+            "name": "Grant Charter",
+            "summary": "Your patron funds the kingdom heavily, but many settlers keep outside loyalties.",
+            "abilityBoosts": ["Economy", "One free ability boost"],
+            "abilityFlaw": "Loyalty"
+          },
+          {
+            "name": "Open Charter",
+            "summary": "You claim the land as free agents without sponsor restrictions or direct support.",
+            "abilityBoosts": ["One free ability boost"],
+            "abilityFlaw": "None"
+          }
+        ],
+        "heartlands": [
+          {
+            "name": "Forest or Swamp",
+            "summary": "Abundant natural resources and wonder shape the nation’s outlook.",
+            "abilityBoosts": ["Culture"],
+            "abilityFlaw": "None"
+          },
+          {
+            "name": "Hill or Plain",
+            "summary": "Easy travel and open land make life more manageable for the population.",
+            "abilityBoosts": ["Loyalty"],
+            "abilityFlaw": "None"
+          },
+          {
+            "name": "Lake or River",
+            "summary": "Water access naturally supports trade and movement before roads exist.",
+            "abilityBoosts": ["Economy"],
+            "abilityFlaw": "None"
+          },
+          {
+            "name": "Mountain or Ruins",
+            "summary": "Harsh terrain or ancient remains reinforce a defensive, hardy culture.",
+            "abilityBoosts": ["Stability"],
+            "abilityFlaw": "None"
+          }
+        ],
+        "governments": [
+          {
+            "name": "Despotism",
+            "summary": "A single absolute ruler dominates the nation’s decisions.",
+            "abilityBoosts": ["Stability", "Economy", "One free ability boost"],
+            "trainedSkills": ["Intrigue", "Warfare"],
+            "bonusFeat": "Crush Dissent"
+          },
+          {
+            "name": "Feudalism",
+            "summary": "A royal line rules through vassals, nobles, and distributed local power.",
+            "abilityBoosts": ["Stability", "Culture", "One free ability boost"],
+            "trainedSkills": ["Defense", "Trade"],
+            "bonusFeat": "Fortified Fiefs"
+          },
+          {
+            "name": "Oligarchy",
+            "summary": "A council of influential leaders governs the nation together.",
+            "abilityBoosts": ["Loyalty", "Economy", "One free ability boost"],
+            "trainedSkills": ["Arts", "Industry"],
+            "bonusFeat": "Insider Trading"
+          },
+          {
+            "name": "Republic",
+            "summary": "Citizens elect representatives who guide the nation through formal bodies.",
+            "abilityBoosts": ["Stability", "Loyalty", "One free ability boost"],
+            "trainedSkills": ["Engineering", "Politics"],
+            "bonusFeat": "Pull Together"
+          },
+          {
+            "name": "Thaumocracy",
+            "summary": "Those most skilled in magic shape the nation’s rule and public policy.",
+            "abilityBoosts": ["Economy", "Culture", "One free ability boost"],
+            "trainedSkills": ["Folklore", "Magic"],
+            "bonusFeat": "Practical Magic"
+          },
+          {
+            "name": "Yeomanry",
+            "summary": "Local citizens and regional leaders govern in a decentralized way.",
+            "abilityBoosts": ["Loyalty", "Culture", "One free ability boost"],
+            "trainedSkills": ["Agriculture", "Wilderness"],
+            "bonusFeat": "Muddle Through"
+          }
+        ]
+      },
       "advancement": [
         { "level": 1, "controlDC": 14, "features": ["Charter", "Government", "Heartland", "Initial proficiencies", "Favored land", "Village construction"] },
         { "level": 2, "controlDC": 15, "features": ["Kingdom feat", "Skill increase", "Untrained Improvisation"] },
